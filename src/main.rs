@@ -51,8 +51,20 @@ fn main() -> Result<()> {
 
     println!("{}", format!("Packaging {}...", app_name).bold().bright_magenta());
 
-    let binary_dir = binary_path.parent().unwrap_or_else(|| Path::new("."));
-    let resolver = LibraryResolver::new(binary_dir, &args.search_paths);
+    let is_msvc = if let Ok((_, deps)) = parse_dependencies(&binary_path) {
+        deps.iter().any(|d| {
+            let dl = d.to_ascii_lowercase();
+            dl.starts_with("msvcp") || dl.starts_with("vcruntime")
+        })
+    } else {
+        false
+    };
+
+    if is_msvc {
+        println!("  {} Detected MSVC toolchain binary", "➜".cyan());
+    }
+
+    let resolver = LibraryResolver::new(&binary_path, &args.search_paths, is_msvc);
 
     let mut resolved_libraries: HashMap<String, Option<PathBuf>> = HashMap::new();
     let mut to_scan: Vec<PathBuf> = vec![binary_path.clone()];
@@ -87,8 +99,18 @@ fn main() -> Result<()> {
     let libraries_list: Vec<(String, Option<PathBuf>)> = resolved_libraries.into_iter().collect();
     println!("  Total libraries resolved: {}", libraries_list.len());
 
+    let project_root = if let Some(p) = binary_path.parent() {
+        if p.ends_with("Release") || p.ends_with("Debug") || p.ends_with("x64") {
+            p.parent().and_then(|pp| pp.parent()).unwrap_or(&current_dir)
+        } else {
+            &current_dir
+        }
+    } else {
+        &current_dir
+    };
+
     let asset_collector = AssetCollector::discover(
-        &current_dir,
+        project_root,
         &config.asset_dirs,
         &args.extra_assets,
     );
@@ -101,7 +123,7 @@ fn main() -> Result<()> {
     let mut staging = StagingBuilder::new(&args.output, &app_name)?;
     staging.copy_binary(&binary_path)?;
     staging.copy_libraries(&libraries_list)?;
-    staging.copy_assets(asset_collector.directories(), &valid_font)?;
+    staging.copy_assets(asset_collector.directories())?;
     staging.copy_loose_files(asset_collector.files())?;
     staging.enforce_resources(&valid_font)?;
 
