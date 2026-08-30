@@ -1,127 +1,156 @@
-use anyhow::{anyhow, Context, Result};
-use std::fs;
+use anyhow::{Context, Result};
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use walkdir::WalkDir;
 
-pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str) -> Result<()> {
-    let mut files = Vec::new();
+pub fn create_standalone_executable(
+    staging_dir: &Path,
+    output_path: &Path,
+    app_name: &str,
+) -> Result<PathBuf> {
+    let zip_payload_path = staging_dir.join("payload.zip");
+    crate::packager::zip::create_zip_package(staging_dir, &zip_payload_path)?;
 
-    for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            let path = entry.path().to_path_buf();
-            let rel = path.strip_prefix(staging_dir)?.to_string_lossy().replace('\\', "/");
-            files.push((path, rel));
+    let mut zip_bytes = Vec::new();
+    File::open(&zip_payload_path)?.read_to_end(&mut zip_bytes)?;
+    let _ = fs::remove_file(zip_payload_path);
+
+    let temp_stub_c = staging_dir.join("stub.c");
+    let temp_res_rc = staging_dir.join("resource.rc");
+    let temp_res_o = staging_dir.join("resource.o");
+    let temp_bin_dat = staging_dir.join("payload.dat");
+
+    File::create(&temp_bin_dat)?.write_all(&zip_bytes)?;
+
+    let rc_content = "101 RCDATA \"payload.dat\"\n";
+    fs::write(&temp_res_rc, rc_content)?;
+
+    let stub_c_code = r#"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    char tempPath[MAX_PATH];
+    char extractDir[MAX_PATH];
+    char targetExe[MAX_PATH];
+    
+    GetTempPathA(MAX_PATH, tempPath);
+    
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    char* baseName = strrchr(exePath, '\\');
+    baseName = baseName ? baseName + 1 : exePath;
+
+    snprintf(extractDir, MAX_PATH, "%sShipApp_%s", tempPath, baseName);
+    CreateDirectoryA(extractDir, NULL);
+
+    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCE(101), RT_RCDATA);
+    if (hRes) {
+        HGLOBAL hData = LoadResource(NULL, hRes);
+        DWORD size = SizeofResource(NULL, hRes);
+        void* pData = LockResource(hData);
+        
+        char zipPath[MAX_PATH];
+        snprintf(zipPath, MAX_PATH, "%s\\payload.zip", extractDir);
+        FILE* f = fopen(zipPath, "wb");
+        if (f) {
+            fwrite(pData, 1, size, f);
+            fclose(f);
+            
+            char cmd[MAX_PATH * 3];
+            snprintf(cmd, sizeof(cmd), "powershell -WindowStyle Hidden -NoProfile -Command \"Expand-Archive -Path '%s' -DestinationPath '%s' -Force\"", zipPath, extractDir);
+            
+            STARTUPINFOA si;
+            PROCESS_INFORMATION pi;
+            ZeroMemory(&si, sizeof(si));
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            ZeroMemory(&pi, sizeof(pi));
+            
+            if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            DeleteFileA(zipPath);
         }
     }
 
-    let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build");
-    fs::create_dir_all(&temp_build)?;
+    WIN32_FIND_DATAA fd;
+    char searchMask[MAX_PATH];
+    snprintf(searchMask, MAX_PATH, "%s\\*.exe", extractDir);
+    HANDLE hFind = FindFirstFileA(searchMask, &fd);
+    
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (_stricmp(fd.cFileName, baseName) != 0) {
+                snprintf(targetExe, MAX_PATH, "%s\\%s", extractDir, fd.cFileName);
+                break;
+            }
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
 
-    let asm_file = temp_build.join("payload.s");
-    let c_file = temp_build.join("stub.c");
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        ZeroMemory(&pi, sizeof(pi));
 
-    let mut asm_content = String::from(".section .rdata,\"dr\"\n");
-    let mut c_content = String::new();
-
-    c_content.push_str("#include <windows.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n");
-    c_content.push_str("typedef struct { const char* rel_path; const unsigned char* start; const unsigned char* end; } EmbeddedFile;\n\n");
-
-    for (i, (abs_path, _)) in files.iter().enumerate() {
-        asm_content.push_str(&format!(
-            ".global payload_file_{i}\n.global payload_file_{i}_end\npayload_file_{i}:\n    .incbin \"{}\"\npayload_file_{i}_end:\n\n",
-            abs_path.display()
-        ));
-
-        c_content.push_str(&format!(
-            "extern const unsigned char payload_file_{i}[];\nextern const unsigned char payload_file_{i}_end[];\n"
-        ));
+        if (CreateProcessA(NULL, targetExe, NULL, NULL, FALSE, 0, NULL, extractDir, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
     }
 
-    c_content.push_str("\nstatic const EmbeddedFile g_files[] = {\n");
-    for (i, (_, rel_path)) in files.iter().enumerate() {
-        c_content.push_str(&format!(
-            "    {{ \"{rel_path}\", payload_file_{i}, payload_file_{i}_end }},\n"
-        ));
+    return 0;
+}
+"#;
+
+    fs::write(&temp_stub_c, stub_c_code)?;
+
+    let windres_status = Command::new("x86_64-w64-mingw32-windres")
+        .current_dir(staging_dir)
+        .arg("resource.rc")
+        .arg("-O")
+        .arg("coff")
+        .arg("-o")
+        .arg("resource.o")
+        .status()
+        .context("Failed to run windres")?;
+
+    if !windres_status.success() {
+        anyhow::bail!("windres failed to compile payload resource");
     }
-    c_content.push_str("};\n\n");
 
-    c_content.push_str(&format!(
-        r#"
-static void create_parent_dirs(char* path) {{
-    for (char* p = path; *p; p++) {{
-        if (*p == '/' || *p == '\\') {{
-            char old = *p;
-            *p = '\0';
-            CreateDirectoryA(path, NULL);
-            *p = old;
-        }}
-    }}
-}}
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {{
-    char temp[MAX_PATH];
-    GetTempPathA(MAX_PATH, temp);
-
-    char app_dir[MAX_PATH];
-    snprintf(app_dir, MAX_PATH, "%sShipApp_%s", temp, "{main_exe_name}");
-    CreateDirectoryA(app_dir, NULL);
-
-    size_t count = sizeof(g_files) / sizeof(g_files[0]);
-    for (size_t i = 0; i < count; i++) {{
-        char out_path[MAX_PATH];
-        snprintf(out_path, MAX_PATH, "%s/%s", app_dir, g_files[i].rel_path);
-        create_parent_dirs(out_path);
-
-        HANDLE hFile = CreateFileA(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {{
-            DWORD written = 0;
-            size_t size = (size_t)(g_files[i].end - g_files[i].start);
-            WriteFile(hFile, g_files[i].start, (DWORD)size, &written, NULL);
-            CloseHandle(hFile);
-        }}
-    }}
-
-    char exe_path[MAX_PATH];
-    snprintf(exe_path, MAX_PATH, "%s/{main_exe_name}", app_dir);
-
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-
-    if (CreateProcessA(exe_path, GetCommandLineA(), NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {{
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return (int)code;
-    }}
-    return 1;
-}}
-"#
-    ));
-
-    fs::write(&asm_file, asm_content)?;
-    fs::write(&c_file, c_content)?;
-
-    let status = Command::new("x86_64-w64-mingw32-gcc")
+    let gcc_status = Command::new("x86_64-w64-mingw32-gcc")
+        .current_dir(staging_dir)
         .arg("-O2")
         .arg("-mwindows")
-        .arg(&asm_file)
-        .arg(&c_file)
         .arg("-o")
-        .arg(output_exe)
+        .arg(output_path)
+        .arg("stub.c")
+        .arg("resource.o")
         .status()
-        .context("Failed to invoke MinGW compiler for standalone stub")?;
+        .context("Failed to run MinGW GCC for standalone stub")?;
 
-    let _ = fs::remove_dir_all(&temp_build);
+    let _ = fs::remove_file(temp_stub_c);
+    let _ = fs::remove_file(temp_res_rc);
+    let _ = fs::remove_file(temp_res_o);
+    let _ = fs::remove_file(temp_bin_dat);
 
-    if !status.success() {
-        return Err(anyhow!("Failed to build standalone executable"));
+    if !gcc_status.success() {
+        anyhow::bail!("Failed to link standalone executable");
     }
 
-    Ok(())
+    Ok(output_path.to_path_buf())
 }

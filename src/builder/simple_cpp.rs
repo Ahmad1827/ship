@@ -108,6 +108,11 @@ pub fn build_direct(project_dir: &Path, sources: &[PathBuf], target: TargetPlatf
     let mut cmd = Command::new(compiler);
     cmd.current_dir(project_dir);
     cmd.arg("-O3");
+
+    if target == TargetPlatform::Windows {
+        cmd.arg("-mwindows");
+    }
+
     for src in sources {
         cmd.arg(src);
     }
@@ -157,6 +162,7 @@ pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildRe
         config_cmd.arg("-DCMAKE_SYSTEM_NAME=Windows");
         config_cmd.arg("-DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc");
         config_cmd.arg("-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++");
+        config_cmd.arg("-DCMAKE_EXE_LINKER_FLAGS=-mwindows");
 
         let cmakelists = fs::read_to_string(project_dir.join("CMakeLists.txt")).unwrap_or_default();
         if cmakelists.contains("SFML") {
@@ -194,7 +200,6 @@ pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildRe
         let path = entry.path();
         let path_str = path.to_string_lossy();
 
-        // Ignoră fișierele interne de configurare CMake
         if path_str.contains("CMakeFiles") || path_str.contains("CMakeTmp") {
             continue;
         }
@@ -221,7 +226,6 @@ pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildRe
         }
     }
 
-    // Fallback: căutare după orice binar generat în afara CMakeFiles
     for entry in WalkDir::new(&build_dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         let path_str = path.to_string_lossy();
@@ -247,6 +251,7 @@ pub fn build_make(project_dir: &Path, target: TargetPlatform) -> Result<BuildRes
     if target == TargetPlatform::Windows {
         cmd.arg("CC=x86_64-w64-mingw32-gcc");
         cmd.arg("CXX=x86_64-w64-mingw32-g++");
+        cmd.arg("LDFLAGS=-mwindows");
     }
 
     let status = cmd.status().context("Failed to run make")?;
