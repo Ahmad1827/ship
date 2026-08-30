@@ -1,20 +1,50 @@
 use anyhow::{Context, Result};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use walkdir::WalkDir;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
 
-pub fn create_standalone_executable(
+fn create_payload_zip(staging_dir: &Path, zip_path: &Path) -> Result<()> {
+    let file = File::create(zip_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path == zip_path {
+            continue;
+        }
+
+        let name = path.strip_prefix(staging_dir)?;
+        let name_str = name.to_str().context("Invalid unicode in path")?;
+
+        if path.is_file() {
+            zip.start_file(name_str, options)?;
+            let mut f = File::open(path)?;
+            io::copy(&mut f, &mut zip)?;
+        } else if !name_str.is_empty() {
+            zip.add_directory(name_str, options)?;
+        }
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+pub fn build_standalone_exe<P: AsRef<Path>>(
     staging_dir: &Path,
-    output_path: &Path,
-    app_name: &str,
+    output_exe: &Path,
+    _main_bin: P,
 ) -> Result<PathBuf> {
     let zip_payload_path = staging_dir.join("payload.zip");
-    crate::packager::zip::create_zip_package(staging_dir, &zip_payload_path)?;
+    create_payload_zip(staging_dir, &zip_payload_path)?;
 
     let mut zip_bytes = Vec::new();
     File::open(&zip_payload_path)?.read_to_end(&mut zip_bytes)?;
-    let _ = fs::remove_file(zip_payload_path);
+    let _ = fs::remove_file(&zip_payload_path);
 
     let temp_stub_c = staging_dir.join("stub.c");
     let temp_res_rc = staging_dir.join("resource.rc");
@@ -128,7 +158,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         anyhow::bail!("windres failed to compile payload resource");
     }
 
-    if let Some(parent) = output_path.parent() {
+    if let Some(parent) = output_exe.parent() {
         fs::create_dir_all(parent)?;
     }
 
@@ -137,7 +167,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         .arg("-O2")
         .arg("-mwindows")
         .arg("-o")
-        .arg(output_path)
+        .arg(output_exe)
         .arg("stub.c")
         .arg("resource.o")
         .status()
@@ -152,5 +182,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         anyhow::bail!("Failed to link standalone executable");
     }
 
-    Ok(output_path.to_path_buf())
+    Ok(output_exe.to_path_buf())
 }
