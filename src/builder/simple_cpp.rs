@@ -111,6 +111,30 @@ pub fn build_direct(project_dir: &Path, sources: &[PathBuf], target: TargetPlatf
 
     if target == TargetPlatform::Windows {
         cmd.arg("-mwindows");
+
+        for entry in WalkDir::new(project_dir).max_depth(2).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                if let Some(ext) = entry.path().extension().and_then(|s| s.to_str()) {
+                    if ext.eq_ignore_ascii_case("rc") {
+                        let res_o = build_dir.join("app_res.o");
+                        let st = Command::new("x86_64-w64-mingw32-windres")
+                            .current_dir(project_dir)
+                            .arg(entry.path())
+                            .arg("-O")
+                            .arg("coff")
+                            .arg("-o")
+                            .arg(&res_o)
+                            .status();
+                        if let Ok(s) = st {
+                            if s.success() && res_o.exists() {
+                                cmd.arg(&res_o);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     for src in sources {

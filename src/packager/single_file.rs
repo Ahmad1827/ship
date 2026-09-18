@@ -1,8 +1,42 @@
 use anyhow::{anyhow, Context, Result};
+use colored::*;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
+
+fn find_icon_file(staging_dir: &Path) -> Option<PathBuf> {
+    for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            if let Some(ext) = entry.path().extension().and_then(|s| s.to_str()) {
+                if ext.eq_ignore_ascii_case("ico") {
+                    return Some(entry.path().to_path_buf());
+                }
+            }
+        }
+    }
+
+    if let Ok(cur) = env::current_dir() {
+        for name in &["wisdomParkicon.ico", "app.ico", "icon.ico"] {
+            let p = cur.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        for entry in WalkDir::new(&cur).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                if let Some(ext) = entry.path().extension().and_then(|s| s.to_str()) {
+                    if ext.eq_ignore_ascii_case("ico") {
+                        return Some(entry.path().to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
 
 pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str) -> Result<()> {
     let mut files = Vec::new();
@@ -107,15 +141,49 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     fs::write(&asm_file, asm_content)?;
     fs::write(&c_file, c_content)?;
 
+    let mut res_obj = None;
+    if let Some(icon_path) = find_icon_file(staging_dir) {
+        println!("{} Found icon file: {}", "🎨".bright_yellow(), icon_path.display().to_string().bright_white());
+        let icon_dest = temp_build.join("icon.ico");
+        if fs::copy(&icon_path, &icon_dest).is_ok() {
+            let rc_file = temp_build.join("icon.rc");
+            let rc_content = "1 ICON \"icon.ico\"\n";
+            if fs::write(&rc_file, rc_content).is_ok() {
+                let res_file = temp_build.join("icon.o");
+                let windres_status = Command::new("x86_64-w64-mingw32-windres")
+                    .current_dir(&temp_build)
+                    .arg("icon.rc")
+                    .arg("-O")
+                    .arg("coff")
+                    .arg("-o")
+                    .arg("icon.o")
+                    .status();
+
+                if let Ok(st) = windres_status {
+                    if st.success() && res_file.exists() {
+                        println!("{} Embedded crown icon into standalone executable", "✔".green());
+                        res_obj = Some(res_file);
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(parent) = output_exe.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let status = Command::new("x86_64-w64-mingw32-gcc")
-        .arg("-O2")
+    let mut gcc_cmd = Command::new("x86_64-w64-mingw32-gcc");
+    gcc_cmd.arg("-O2")
         .arg("-mwindows")
         .arg(&asm_file)
-        .arg(&c_file)
+        .arg(&c_file);
+
+    if let Some(ref res) = res_obj {
+        gcc_cmd.arg(res);
+    }
+
+    let status = gcc_cmd
         .arg("-o")
         .arg(output_exe)
         .status()
