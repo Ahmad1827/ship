@@ -45,6 +45,51 @@ fn convert_png_to_ico(png_path: &Path, ico_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn generate_default_ico(ico_path: &Path) -> Result<()> {
+    let mut buf = Vec::with_capacity(1150);
+
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.extend_from_slice(&[0x01, 0x00]);
+    buf.extend_from_slice(&[0x01, 0x00]);
+
+    buf.extend_from_slice(&[16, 16, 0, 0]);
+    buf.extend_from_slice(&[0x01, 0x00]);
+    buf.extend_from_slice(&[0x20, 0x00]);
+    buf.extend_from_slice(&(1128u32).to_le_bytes());
+    buf.extend_from_slice(&(22u32).to_le_bytes());
+
+    buf.extend_from_slice(&(40u32).to_le_bytes());
+    buf.extend_from_slice(&(16i32).to_le_bytes());
+    buf.extend_from_slice(&(32i32).to_le_bytes());
+    buf.extend_from_slice(&(1u16).to_le_bytes());
+    buf.extend_from_slice(&(32u16).to_le_bytes());
+    buf.extend_from_slice(&(0u32).to_le_bytes());
+    buf.extend_from_slice(&(1024u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 16]);
+
+    for y in 0..16 {
+        for x in 0..16 {
+            let is_border = x == 0 || x == 15 || y == 0 || y == 15;
+            let dx = (x as i32 - 7).abs();
+            let dy = (y as i32 - 8).abs();
+            let is_center = (dx + dy) <= 4;
+
+            if is_center {
+                buf.extend_from_slice(&[0x40, 0xd0, 0xff, 0xff]);
+            } else if is_border {
+                buf.extend_from_slice(&[0x60, 0x30, 0x20, 0xff]);
+            } else {
+                buf.extend_from_slice(&[0x22, 0x14, 0x10, 0xff]);
+            }
+        }
+    }
+
+    buf.resize(buf.len() + 64, 0);
+
+    fs::write(ico_path, buf)?;
+    Ok(())
+}
+
 fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
     for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
@@ -227,60 +272,84 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     fs::write(&asm_file, asm_content)?;
     fs::write(&c_file, c_content)?;
 
-    let mut res_obj = None;
-    if let Some(candidate) = find_icon_candidate(staging_dir) {
-        let icon_dest = temp_build.join("icon.ico");
-        let prepared = match candidate {
-            IconCandidate::Ico(ico_path) => {
-                println!("{} Found icon file: {}", "🎨".bright_yellow(), ico_path.display().to_string().bright_white());
-                fs::copy(&ico_path, &icon_dest).is_ok()
-            }
-            IconCandidate::Png(png_path) => {
-                println!("{} Converting PNG icon: {}", "🎨".bright_yellow(), png_path.display().to_string().bright_white());
-                convert_png_to_ico(&png_path, &icon_dest).is_ok()
-            }
-        };
-
-        if prepared {
-            let rc_file = temp_build.join("icon.rc");
-            let rc_content = "1 ICON \"icon.ico\"\n";
-            if fs::write(&rc_file, rc_content).is_ok() {
-                let res_file = temp_build.join("icon.o");
-                let windres_status = Command::new("x86_64-w64-mingw32-windres")
-                    .current_dir(&temp_build)
-                    .arg("icon.rc")
-                    .arg("-O")
-                    .arg("coff")
-                    .arg("-o")
-                    .arg("icon.o")
-                    .status();
-
-                if let Ok(st) = windres_status {
-                    if st.success() && res_file.exists() {
-                        println!("{} Embedded icon into standalone executable", "✔".green());
-                        res_obj = Some(res_file);
-                    }
-                }
-            }
+    let icon_dest = temp_build.join("icon.ico");
+    match find_icon_candidate(staging_dir) {
+        Some(IconCandidate::Ico(ico_path)) => {
+            println!("{} Found icon file: {}", "🎨".bright_yellow(), ico_path.display().to_string().bright_white());
+            let _ = fs::copy(&ico_path, &icon_dest);
         }
+        Some(IconCandidate::Png(png_path)) => {
+            println!("{} Converting PNG icon: {}", "🎨".bright_yellow(), png_path.display().to_string().bright_white());
+            let _ = convert_png_to_ico(&png_path, &icon_dest);
+        }
+        None => {
+            println!("{} No icon found, embedding default icon", "🎨".bright_cyan());
+            let _ = generate_default_ico(&icon_dest);
+        }
+    }
+
+    let rc_file = temp_build.join("resource.rc");
+    let rc_content = format!(
+        r#"1 ICON "icon.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Ship"
+            VALUE "FileDescription", "Glad tidings to the strangers"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "{main_exe_name}"
+            VALUE "LegalCopyright", "Copyright (c) 2026"
+            VALUE "OriginalFilename", "{main_exe_name}.exe"
+            VALUE "ProductName", "{main_exe_name}"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+"#
+    );
+
+    fs::write(&rc_file, rc_content)?;
+
+    let res_file = temp_build.join("resource.o");
+    let windres_status = Command::new("x86_64-w64-mingw32-windres")
+        .current_dir(&temp_build)
+        .arg("resource.rc")
+        .arg("-O")
+        .arg("coff")
+        .arg("-o")
+        .arg("resource.o")
+        .status()
+        .context("Failed to invoke windres for icon and version resources")?;
+
+    if !windres_status.success() {
+        return Err(anyhow!("windres failed to compile resource file"));
     }
 
     if let Some(parent) = output_exe.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut gcc_cmd = Command::new("x86_64-w64-mingw32-gcc");
-    gcc_cmd
+    let status = Command::new("x86_64-w64-mingw32-gcc")
         .arg("-O2")
         .arg("-mwindows")
         .arg(&asm_file)
-        .arg(&c_file);
-
-    if let Some(ref res) = res_obj {
-        gcc_cmd.arg(res);
-    }
-
-    let status = gcc_cmd
+        .arg(&c_file)
+        .arg(&res_file)
         .arg("-o")
         .arg(output_exe)
         .status()
