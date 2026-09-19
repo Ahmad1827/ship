@@ -288,9 +288,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         }
     }
 
+    let manifest_file = temp_build.join("app.manifest");
+    let manifest_content = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Ship.App" type="win32"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
+    fs::write(&manifest_file, manifest_content)?;
+
     let rc_file = temp_build.join("resource.rc");
     let rc_content = format!(
         r#"1 ICON "icon.ico"
+1 24 "app.manifest"
 
 1 VERSIONINFO
 FILEVERSION 1,0,0,0
@@ -334,7 +354,7 @@ END
         .arg("-o")
         .arg("resource.o")
         .status()
-        .context("Failed to invoke windres for icon and version resources")?;
+        .context("Failed to invoke windres for icon, manifest, and version resources")?;
 
     if !windres_status.success() {
         return Err(anyhow!("windres failed to compile resource file"));
