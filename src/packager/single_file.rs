@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use colored::*;
 use std::env;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -180,6 +181,18 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
         }
     }
 
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (abs_path, rel) in &files {
+        rel.hash(&mut hasher);
+        if let Ok(meta) = fs::metadata(abs_path) {
+            meta.len().hash(&mut hasher);
+        }
+        if let Ok(bytes) = fs::read(abs_path) {
+            bytes.hash(&mut hasher);
+        }
+    }
+    let build_hash = format!("{:016x}", hasher.finish());
+
     let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build");
     fs::create_dir_all(&temp_build)?;
 
@@ -189,7 +202,8 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
     let mut asm_content = String::from(".section .rdata,\"dr\"\n");
     let mut c_content = String::new();
 
-    c_content.push_str("#include <windows.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n");
+    c_content.push_str("#include <windows.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
+    c_content.push_str(&format!("#define SHIP_BUILD_HASH \"{}\"\n\n", build_hash));
     c_content.push_str("typedef struct { const char* rel_path; const unsigned char* start; const unsigned char* end; } EmbeddedFile;\n\n");
 
     for (i, (abs_path, _)) in files.iter().enumerate() {
@@ -232,23 +246,52 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     snprintf(app_dir, MAX_PATH, "%sShipApp_%s", temp, "{main_exe_name}");
     CreateDirectoryA(app_dir, NULL);
 
-    size_t count = sizeof(g_files) / sizeof(g_files[0]);
-    for (size_t i = 0; i < count; i++) {{
-        char out_path[MAX_PATH];
-        snprintf(out_path, MAX_PATH, "%s/%s", app_dir, g_files[i].rel_path);
-        create_parent_dirs(out_path);
-
-        HANDLE hFile = CreateFileA(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {{
-            DWORD written = 0;
-            size_t size = (size_t)(g_files[i].end - g_files[i].start);
-            WriteFile(hFile, g_files[i].start, (DWORD)size, &written, NULL);
-            CloseHandle(hFile);
-        }}
-    }}
+    char hash_path[MAX_PATH];
+    snprintf(hash_path, MAX_PATH, "%s/.ship_hash", app_dir);
 
     char exe_path[MAX_PATH];
     snprintf(exe_path, MAX_PATH, "%s/{main_exe_name}", app_dir);
+
+    int need_extract = 1;
+    FILE* hf = fopen(hash_path, "r");
+    if (hf) {{
+        char stored_hash[64] = {{0}};
+        if (fgets(stored_hash, sizeof(stored_hash), hf)) {{
+            char* nl = strchr(stored_hash, '\n');
+            if (nl) *nl = '\0';
+            char* cr = strchr(stored_hash, '\r');
+            if (cr) *cr = '\0';
+            if (strcmp(stored_hash, SHIP_BUILD_HASH) == 0) {{
+                DWORD attr = GetFileAttributesA(exe_path);
+                if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {{
+                    need_extract = 0;
+                }}
+            }}
+        }}
+        fclose(hf);
+    }}
+
+    if (need_extract) {{
+        size_t count = sizeof(g_files) / sizeof(g_files[0]);
+        for (size_t i = 0; i < count; i++) {{
+            char out_path[MAX_PATH];
+            snprintf(out_path, MAX_PATH, "%s/%s", app_dir, g_files[i].rel_path);
+            create_parent_dirs(out_path);
+
+            HANDLE hFile = CreateFileA(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {{
+                DWORD written = 0;
+                size_t size = (size_t)(g_files[i].end - g_files[i].start);
+                WriteFile(hFile, g_files[i].start, (DWORD)size, &written, NULL);
+                CloseHandle(hFile);
+            }}
+        }}
+        FILE* out_hf = fopen(hash_path, "w");
+        if (out_hf) {{
+            fputs(SHIP_BUILD_HASH, out_hf);
+            fclose(out_hf);
+        }}
+    }}
 
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
