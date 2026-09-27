@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
+use super::archive::ArchiveBuilder;
+
 enum IconCandidate {
     Ico(PathBuf),
     Png(PathBuf),
@@ -171,62 +173,64 @@ fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
 }
 
 pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str) -> Result<()> {
-    let mut files = Vec::new();
+    let mut archive_builder = ArchiveBuilder::new();
 
     for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
-            let path = entry.path().to_path_buf();
+            let path = entry.path();
             let rel = path.strip_prefix(staging_dir)?.to_string_lossy().replace('\\', "/");
-            files.push((path, rel));
+            archive_builder.add_file(path, &rel)?;
         }
     }
 
+    let archive_bytes = archive_builder.build()?;
+
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (abs_path, rel) in &files {
-        rel.hash(&mut hasher);
-        if let Ok(meta) = fs::metadata(abs_path) {
-            meta.len().hash(&mut hasher);
-        }
-        if let Ok(bytes) = fs::read(abs_path) {
-            bytes.hash(&mut hasher);
-        }
-    }
+    archive_bytes.hash(&mut hasher);
     let build_hash = format!("{:016x}", hasher.finish());
 
     let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build");
     fs::create_dir_all(&temp_build)?;
 
+    let archive_bin_path = temp_build.join("payload.bin");
+    fs::write(&archive_bin_path, &archive_bytes)?;
+
     let asm_file = temp_build.join("payload.s");
+    let asm_content = format!(
+        ".section .rdata,\"dr\"\n\
+         .global ship_payload_start\n\
+         .global ship_payload_end\n\
+         ship_payload_start:\n\
+             .incbin \"{}\"\n\
+         ship_payload_end:\n",
+        archive_bin_path.display()
+    );
+    fs::write(&asm_file, asm_content)?;
+
     let c_file = temp_build.join("stub.c");
+    let c_content = format!(
+        r#"#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-    let mut asm_content = String::from(".section .rdata,\"dr\"\n");
-    let mut c_content = String::new();
+#define SHIP_BUILD_HASH "{build_hash}"
 
-    c_content.push_str("#include <windows.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
-    c_content.push_str(&format!("#define SHIP_BUILD_HASH \"{}\"\n\n", build_hash));
-    c_content.push_str("typedef struct { const char* rel_path; const unsigned char* start; const unsigned char* end; } EmbeddedFile;\n\n");
+extern const unsigned char ship_payload_start[];
+extern const unsigned char ship_payload_end[];
 
-    for (i, (abs_path, _)) in files.iter().enumerate() {
-        asm_content.push_str(&format!(
-            ".global payload_file_{i}\n.global payload_file_{i}_end\npayload_file_{i}:\n    .incbin \"{}\"\npayload_file_{i}_end:\n\n",
-            abs_path.display()
-        ));
+static unsigned int calc_crc32(const unsigned char *data, size_t len) {{
+    unsigned int crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {{
+        crc ^= (unsigned int)data[i];
+        for (int j = 0; j < 8; j++) {{
+            unsigned int mask = -(crc & 1);
+            crc = (crc >> 1) ^ (0xEDB88320U & mask);
+        }}
+    }}
+    return ~crc;
+}}
 
-        c_content.push_str(&format!(
-            "extern const unsigned char payload_file_{i}[];\nextern const unsigned char payload_file_{i}_end[];\n"
-        ));
-    }
-
-    c_content.push_str("\nstatic const EmbeddedFile g_files[] = {\n");
-    for (i, (_, rel_path)) in files.iter().enumerate() {
-        c_content.push_str(&format!(
-            "    {{ \"{rel_path}\", payload_file_{i}, payload_file_{i}_end }},\n"
-        ));
-    }
-    c_content.push_str("};\n\n");
-
-    c_content.push_str(&format!(
-        r#"
 static void create_parent_dirs(char* path) {{
     for (char* p = path; *p; p++) {{
         if (*p == '/' || *p == '\\') {{
@@ -272,20 +276,71 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     }}
 
     if (need_extract) {{
-        size_t count = sizeof(g_files) / sizeof(g_files[0]);
-        for (size_t i = 0; i < count; i++) {{
+        const unsigned char* p = ship_payload_start;
+        const unsigned char* end_ptr = ship_payload_end;
+
+        if ((size_t)(end_ptr - p) < 12 || memcmp(p, "SHIP", 4) != 0) {{
+            return 1;
+        }}
+
+        p += 4; // magic
+        p += 2; // version
+        p += 2; // reserved
+
+        unsigned int file_count = 0;
+        memcpy(&file_count, p, 4);
+        p += 4;
+
+        const unsigned char* cur = p;
+        for (unsigned int i = 0; i < file_count; i++) {{
+            unsigned short plen = 0;
+            memcpy(&plen, cur, 2);
+            cur += 2 + plen + 8 + 8 + 4;
+        }}
+        const unsigned char* data_start = cur;
+
+        cur = p;
+        for (unsigned int i = 0; i < file_count; i++) {{
+            unsigned short path_len = 0;
+            memcpy(&path_len, cur, 2);
+            cur += 2;
+
+            char rel_path[MAX_PATH] = {{0}};
+            if (path_len < MAX_PATH) {{
+                memcpy(rel_path, cur, path_len);
+                rel_path[path_len] = '\0';
+            }}
+            cur += path_len;
+
+            unsigned long long size = 0;
+            memcpy(&size, cur, 8);
+            cur += 8;
+
+            unsigned long long offset = 0;
+            memcpy(&offset, cur, 8);
+            cur += 8;
+
+            unsigned int expected_crc = 0;
+            memcpy(&expected_crc, cur, 4);
+            cur += 4;
+
+            const unsigned char* file_bytes = data_start + offset;
+            if (calc_crc32(file_bytes, (size_t)size) != expected_crc) {{
+                return 2;
+            }}
+
             char out_path[MAX_PATH];
-            snprintf(out_path, MAX_PATH, "%s/%s", app_dir, g_files[i].rel_path);
+            snprintf(out_path, MAX_PATH, "%s/%s", app_dir, rel_path);
             create_parent_dirs(out_path);
 
             HANDLE hFile = CreateFileA(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) {{
                 DWORD written = 0;
-                size_t size = (size_t)(g_files[i].end - g_files[i].start);
-                WriteFile(hFile, g_files[i].start, (DWORD)size, &written, NULL);
+                WriteFile(hFile, file_bytes, (DWORD)size, &written, NULL);
                 CloseHandle(hFile);
             }}
         }}
+
         FILE* out_hf = fopen(hash_path, "w");
         if (out_hf) {{
             fputs(SHIP_BUILD_HASH, out_hf);
@@ -307,12 +362,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         CloseHandle(pi.hThread);
         return (int)code;
     }}
+
     return 1;
 }}
 "#
-    ));
-
-    fs::write(&asm_file, asm_content)?;
+    );
     fs::write(&c_file, c_content)?;
 
     let icon_dest = temp_build.join("icon.ico");
@@ -385,7 +439,6 @@ BEGIN
 END
 "#
     );
-
     fs::write(&rc_file, rc_content)?;
 
     let res_file = temp_build.join("resource.o");
