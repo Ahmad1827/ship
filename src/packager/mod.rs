@@ -98,10 +98,21 @@ impl<'a> StagingBuilder<'a> {
         fs::create_dir_all(&res_dir)?;
         
         let target_font = res_dir.join("font.ttf");
-        fs::copy(valid_font, &target_font)?;
-        fs::copy(valid_font, self.staging_dir.join("font.ttf"))?;
+        if !target_font.exists() {
+            fs::copy(valid_font, &target_font)?;
+        }
         
-        println!("  {} Injected verified static TTF into Resources/font.ttf", "✔".green());
+        let root_font = self.staging_dir.join("font.ttf");
+        if !root_font.exists() {
+            fs::copy(valid_font, &root_font)?;
+        }
+
+        let arial_font = self.staging_dir.join("arial.ttf");
+        if !arial_font.exists() {
+            fs::copy(valid_font, &arial_font)?;
+        }
+        
+        println!("  {} Enforced verified complete TrueType font in staging directories", "✔".green());
         Ok(())
     }
 

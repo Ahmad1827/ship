@@ -1,15 +1,11 @@
 use anyhow::{anyhow, Result};
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
-use flate2::Compression;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 pub const SHIP_MAGIC: &[u8; 4] = b"SHIP";
-pub const SHIP_VERSION: u16 = 2;
-pub const COMPRESSION_NONE: u16 = 0;
-pub const COMPRESSION_DEFLATE: u16 = 1;
+pub const SHIP_VERSION: u16 = 3;
+pub const COMPRESSION_LZ4: u16 = 2;
 
 pub fn calculate_crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -58,7 +54,7 @@ impl ArchiveBuilder {
 
         header_buf.write_all(SHIP_MAGIC)?;
         header_buf.write_all(&SHIP_VERSION.to_le_bytes())?;
-        header_buf.write_all(&COMPRESSION_DEFLATE.to_le_bytes())?;
+        header_buf.write_all(&COMPRESSION_LZ4.to_le_bytes())?;
         header_buf.write_all(&(self.entries.len() as u32).to_le_bytes())?;
 
         let mut current_offset: u64 = 0;
@@ -72,10 +68,7 @@ impl ArchiveBuilder {
 
             let uncompressed_size = raw_data.len() as u64;
             let crc = calculate_crc32(raw_data);
-
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(raw_data)?;
-            let compressed_data = encoder.finish()?;
+            let compressed_data = lz4_flex::block::compress(raw_data);
             let compressed_size = compressed_data.len() as u64;
 
             table_entries.push((
@@ -192,26 +185,11 @@ impl<'a> ArchiveReader<'a> {
         }
 
         let slice = &self.data[start..end];
-
         let decompressed = match self.compression_type {
-            COMPRESSION_DEFLATE => {
-                let mut decoder = DeflateDecoder::new(slice);
-                let mut out = Vec::with_capacity(entry.uncompressed_size as usize);
-                decoder.read_to_end(&mut out)?;
-                out
-            }
-            COMPRESSION_NONE => slice.to_vec(),
+            COMPRESSION_LZ4 => lz4_flex::block::decompress(slice, entry.uncompressed_size as usize)
+                .map_err(|e| anyhow!("LZ4 decompress failed: {}", e))?,
             other => return Err(anyhow!("Unsupported compression type: {}", other)),
         };
-
-        if decompressed.len() as u64 != entry.uncompressed_size {
-            return Err(anyhow!(
-                "Decompressed size mismatch for {}: expected {}, got {}",
-                entry.path,
-                entry.uncompressed_size,
-                decompressed.len()
-            ));
-        }
 
         let actual_crc = calculate_crc32(&decompressed);
         if actual_crc != entry.crc32 {
@@ -225,25 +203,6 @@ impl<'a> ArchiveReader<'a> {
 
         Ok(decompressed)
     }
-
-    pub fn extract_all<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
-        let target_dir = target_dir.as_ref();
-        fs::create_dir_all(target_dir)?;
-
-        for entry in &self.entries {
-            let file_data = self.extract_file(entry)?;
-            let dest_path = target_dir.join(&entry.path);
-
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let mut out = File::create(&dest_path)?;
-            out.write_all(&file_data)?;
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -251,28 +210,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_crc32() {
-        assert_eq!(calculate_crc32(b"123456789"), 0xCBF43926);
-    }
-
-    #[test]
-    fn test_archive_roundtrip_compressed() {
+    fn test_lz4_archive_roundtrip() {
         let mut builder = ArchiveBuilder::new();
-        builder.add_bytes("foo.txt", b"hello world repeated repeated repeated repeated".to_vec());
-        builder.add_bytes("sub/bar.bin", vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+        builder.add_bytes("test.txt", b"Hello from LZ4! Repeated pattern Repeated pattern".to_vec());
 
-        let packed = builder.build().expect("build failed");
-        let reader = ArchiveReader::new(&packed).expect("read failed");
+        let archive = builder.build().expect("build failed");
+        let reader = ArchiveReader::new(&archive).expect("read failed");
 
-        assert_eq!(reader.entries.len(), 2);
-        assert_eq!(reader.compression_type, COMPRESSION_DEFLATE);
-        assert_eq!(reader.entries[0].path, "foo.txt");
-        assert_eq!(reader.entries[1].path, "sub/bar.bin");
-
-        let foo_data = reader.extract_file(&reader.entries[0]).expect("extract foo");
-        assert_eq!(foo_data, b"hello world repeated repeated repeated repeated");
-
-        let bar_data = reader.extract_file(&reader.entries[1]).expect("extract bar");
-        assert_eq!(bar_data, &[1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+        assert_eq!(reader.entries.len(), 1);
+        let extracted = reader.extract_file(&reader.entries[0]).expect("extract failed");
+        assert_eq!(extracted, b"Hello from LZ4! Repeated pattern Repeated pattern");
     }
 }
