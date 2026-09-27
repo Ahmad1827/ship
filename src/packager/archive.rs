@@ -1,10 +1,15 @@
 use anyhow::{anyhow, Result};
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 pub const SHIP_MAGIC: &[u8; 4] = b"SHIP";
-pub const SHIP_VERSION: u16 = 1;
+pub const SHIP_VERSION: u16 = 2;
+pub const COMPRESSION_NONE: u16 = 0;
+pub const COMPRESSION_DEFLATE: u16 = 1;
 
 pub fn calculate_crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -21,7 +26,8 @@ pub fn calculate_crc32(data: &[u8]) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEntry {
     pub path: String,
-    pub size: u64,
+    pub uncompressed_size: u64,
+    pub compressed_size: u64,
     pub offset: u64,
     pub crc32: u32,
 }
@@ -52,30 +58,42 @@ impl ArchiveBuilder {
 
         header_buf.write_all(SHIP_MAGIC)?;
         header_buf.write_all(&SHIP_VERSION.to_le_bytes())?;
-        header_buf.write_all(&0u16.to_le_bytes())?;
+        header_buf.write_all(&COMPRESSION_DEFLATE.to_le_bytes())?;
         header_buf.write_all(&(self.entries.len() as u32).to_le_bytes())?;
 
         let mut current_offset: u64 = 0;
         let mut table_entries = Vec::new();
 
-        for (path, data) in &self.entries {
+        for (path, raw_data) in &self.entries {
             let path_bytes = path.as_bytes();
             if path_bytes.len() > u16::MAX as usize {
                 return Err(anyhow!("Relative path too long: {}", path));
             }
 
-            let size = data.len() as u64;
-            let crc = calculate_crc32(data);
+            let uncompressed_size = raw_data.len() as u64;
+            let crc = calculate_crc32(raw_data);
 
-            table_entries.push((path_bytes, size, current_offset, crc));
-            current_offset += size;
-            data_buf.write_all(data)?;
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(raw_data)?;
+            let compressed_data = encoder.finish()?;
+            let compressed_size = compressed_data.len() as u64;
+
+            table_entries.push((
+                path_bytes,
+                uncompressed_size,
+                compressed_size,
+                current_offset,
+                crc,
+            ));
+            current_offset += compressed_size;
+            data_buf.write_all(&compressed_data)?;
         }
 
-        for (path_bytes, size, offset, crc) in table_entries {
+        for (path_bytes, uncompressed_size, compressed_size, offset, crc) in table_entries {
             header_buf.write_all(&(path_bytes.len() as u16).to_le_bytes())?;
             header_buf.write_all(path_bytes)?;
-            header_buf.write_all(&size.to_le_bytes())?;
+            header_buf.write_all(&uncompressed_size.to_le_bytes())?;
+            header_buf.write_all(&compressed_size.to_le_bytes())?;
             header_buf.write_all(&offset.to_le_bytes())?;
             header_buf.write_all(&crc.to_le_bytes())?;
         }
@@ -90,6 +108,7 @@ impl ArchiveBuilder {
 
 pub struct ArchiveReader<'a> {
     data: &'a [u8],
+    pub compression_type: u16,
     pub entries: Vec<ArchiveEntry>,
     data_start_offset: usize,
 }
@@ -116,6 +135,7 @@ impl<'a> ArchiveReader<'a> {
         }
 
         cursor.read_exact(&mut u16_buf)?;
+        let compression_type = u16::from_le_bytes(u16_buf);
 
         let mut u32_buf = [0u8; 4];
         cursor.read_exact(&mut u32_buf)?;
@@ -133,7 +153,10 @@ impl<'a> ArchiveReader<'a> {
             let path = String::from_utf8(path_bytes).map_err(|_| anyhow!("Invalid UTF-8 path"))?;
 
             cursor.read_exact(&mut u64_buf)?;
-            let size = u64::from_le_bytes(u64_buf);
+            let uncompressed_size = u64::from_le_bytes(u64_buf);
+
+            cursor.read_exact(&mut u64_buf)?;
+            let compressed_size = u64::from_le_bytes(u64_buf);
 
             cursor.read_exact(&mut u64_buf)?;
             let offset = u64::from_le_bytes(u64_buf);
@@ -143,7 +166,8 @@ impl<'a> ArchiveReader<'a> {
 
             entries.push(ArchiveEntry {
                 path,
-                size,
+                uncompressed_size,
+                compressed_size,
                 offset,
                 crc32,
             });
@@ -153,21 +177,43 @@ impl<'a> ArchiveReader<'a> {
 
         Ok(Self {
             data,
+            compression_type,
             entries,
             data_start_offset,
         })
     }
 
-    pub fn extract_file(&self, entry: &ArchiveEntry) -> Result<&'a [u8]> {
+    pub fn extract_file(&self, entry: &ArchiveEntry) -> Result<Vec<u8>> {
         let start = self.data_start_offset + entry.offset as usize;
-        let end = start + entry.size as usize;
+        let end = start + entry.compressed_size as usize;
 
         if end > self.data.len() {
             return Err(anyhow!("File data extends beyond archive boundary"));
         }
 
         let slice = &self.data[start..end];
-        let actual_crc = calculate_crc32(slice);
+
+        let decompressed = match self.compression_type {
+            COMPRESSION_DEFLATE => {
+                let mut decoder = DeflateDecoder::new(slice);
+                let mut out = Vec::with_capacity(entry.uncompressed_size as usize);
+                decoder.read_to_end(&mut out)?;
+                out
+            }
+            COMPRESSION_NONE => slice.to_vec(),
+            other => return Err(anyhow!("Unsupported compression type: {}", other)),
+        };
+
+        if decompressed.len() as u64 != entry.uncompressed_size {
+            return Err(anyhow!(
+                "Decompressed size mismatch for {}: expected {}, got {}",
+                entry.path,
+                entry.uncompressed_size,
+                decompressed.len()
+            ));
+        }
+
+        let actual_crc = calculate_crc32(&decompressed);
         if actual_crc != entry.crc32 {
             return Err(anyhow!(
                 "CRC32 mismatch for {}: expected {:08X}, got {:08X}",
@@ -177,7 +223,7 @@ impl<'a> ArchiveReader<'a> {
             ));
         }
 
-        Ok(slice)
+        Ok(decompressed)
     }
 
     pub fn extract_all<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
@@ -193,7 +239,7 @@ impl<'a> ArchiveReader<'a> {
             }
 
             let mut out = File::create(&dest_path)?;
-            out.write_all(file_data)?;
+            out.write_all(&file_data)?;
         }
 
         Ok(())
@@ -210,22 +256,23 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_roundtrip() {
+    fn test_archive_roundtrip_compressed() {
         let mut builder = ArchiveBuilder::new();
-        builder.add_bytes("foo.txt", b"hello world".to_vec());
-        builder.add_bytes("sub/bar.bin", vec![1, 2, 3, 4, 5]);
+        builder.add_bytes("foo.txt", b"hello world repeated repeated repeated repeated".to_vec());
+        builder.add_bytes("sub/bar.bin", vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
 
         let packed = builder.build().expect("build failed");
         let reader = ArchiveReader::new(&packed).expect("read failed");
 
         assert_eq!(reader.entries.len(), 2);
+        assert_eq!(reader.compression_type, COMPRESSION_DEFLATE);
         assert_eq!(reader.entries[0].path, "foo.txt");
         assert_eq!(reader.entries[1].path, "sub/bar.bin");
 
         let foo_data = reader.extract_file(&reader.entries[0]).expect("extract foo");
-        assert_eq!(foo_data, b"hello world");
+        assert_eq!(foo_data, b"hello world repeated repeated repeated repeated");
 
         let bar_data = reader.extract_file(&reader.entries[1]).expect("extract bar");
-        assert_eq!(bar_data, &[1, 2, 3, 4, 5]);
+        assert_eq!(bar_data, &[1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
     }
 }
