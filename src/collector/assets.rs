@@ -1,47 +1,6 @@
-use colored::*;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use walkdir::WalkDir;
-
-pub fn get_guaranteed_font() -> PathBuf {
-    let local_candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ];
-
-    for candidate in local_candidates {
-        let p = PathBuf::from(candidate);
-        if p.exists() {
-            return p;
-        }
-    }
-
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let fallback_path = PathBuf::from(home).join(".ship").join("fallback_font.ttf");
-
-    if fallback_path.exists() && fs::metadata(&fallback_path).map_or(false, |m| m.len() > 30000) {
-        return fallback_path;
-    }
-
-    if let Some(parent) = fallback_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let url = "https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf";
-    let _ = Command::new("curl")
-        .arg("-L")
-        .arg("-o")
-        .arg(&fallback_path)
-        .arg(url)
-        .status();
-
-    fallback_path
-}
 
 pub struct AssetCollector {
     found_dirs: Vec<PathBuf>,
@@ -107,30 +66,7 @@ impl AssetCollector {
         &self.found_files
     }
 
-    pub fn has_font(&self) -> bool {
-        for f in &self.found_files {
-            if let Some(ext) = f.extension().and_then(|s| s.to_str()) {
-                if ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf") {
-                    return true;
-                }
-            }
-        }
-
-        for d in &self.found_dirs {
-            for entry in WalkDir::new(d).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file() {
-                    if let Some(ext) = entry.path().extension().and_then(|s| s.to_str()) {
-                        if ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf") {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
+    /// Every "something.ttf" / "something.otf" string literal in the C/C++ sources.
     pub fn detect_referenced_fonts(&self, project_dir: &Path) -> Vec<String> {
         let mut referenced = Vec::new();
 
@@ -146,32 +82,34 @@ impl AssetCollector {
             }
 
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if matches!(ext, "cpp" | "hpp" | "h" | "cc" | "cxx") {
-                if let Ok(content) = fs::read_to_string(path) {
-                    for line in content.lines() {
-                        let lower = line.to_lowercase();
-                        if lower.contains(".ttf") || lower.contains(".otf") {
-                            for quote in ['"', '\''] {
-                                let mut start_idx = None;
-                                for (i, c) in line.char_indices() {
-                                    if c == quote {
-                                        if let Some(s) = start_idx {
-                                            let token = &line[s + 1..i];
-                                            let token_lower = token.to_lowercase();
-                                            if (token_lower.ends_with(".ttf") || token_lower.ends_with(".otf"))
-                                                && !token.contains('\n')
-                                                && token.len() < 128
-                                                && !referenced.contains(&token.to_string())
-                                            {
-                                                referenced.push(token.to_string());
-                                            }
-                                            start_idx = None;
-                                        } else {
-                                            start_idx = Some(i);
-                                        }
-                                    }
-                                }
+            if !matches!(ext, "cpp" | "hpp" | "h" | "cc" | "cxx") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(path) else { continue };
+
+            for line in content.lines() {
+                let lower = line.to_lowercase();
+                if !(lower.contains(".ttf") || lower.contains(".otf")) {
+                    continue;
+                }
+                for quote in ['"', '\''] {
+                    let mut start_idx = None;
+                    for (i, c) in line.char_indices() {
+                        if c != quote {
+                            continue;
+                        }
+                        if let Some(s) = start_idx {
+                            let token = &line[s + 1..i];
+                            let token_lower = token.to_lowercase();
+                            if (token_lower.ends_with(".ttf") || token_lower.ends_with(".otf"))
+                                && token.len() < 256
+                                && !referenced.contains(&token.to_string())
+                            {
+                                referenced.push(token.to_string());
                             }
+                            start_idx = None;
+                        } else {
+                            start_idx = Some(i);
                         }
                     }
                 }
@@ -179,45 +117,5 @@ impl AssetCollector {
         }
 
         referenced
-    }
-
-    pub fn inject_default_font_if_needed(&self, project_dir: &Path, staging_dir: &Path) {
-        if self.has_font() {
-            return;
-        }
-
-        let fallback_font = get_guaranteed_font();
-        if !fallback_font.exists() {
-            return;
-        }
-
-        let mut targets = vec![
-            staging_dir.join("Resources").join("font.ttf"),
-            staging_dir.join("font.ttf"),
-            staging_dir.join("arial.ttf"),
-        ];
-
-        let referenced = self.detect_referenced_fonts(project_dir);
-        for rel in referenced {
-            let clean = rel.trim_start_matches("./").trim_start_matches(".\\");
-            let target_path = staging_dir.join(clean);
-            if !targets.contains(&target_path) {
-                targets.push(target_path);
-            }
-        }
-
-        for dest in targets {
-            if !dest.exists() {
-                if let Some(parent) = dest.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::copy(&fallback_font, &dest);
-            }
-        }
-
-        println!(
-            "{} Injected default TrueType font (DejaVu/Roboto) for unbundled text assets",
-            "✔".bright_green()
-        );
     }
 }

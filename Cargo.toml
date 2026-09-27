@@ -10,5 +10,6 @@ colored = "2.1"
 flate2 = "1.1.10"
 goblin = "0.9"
 lz4_flex = "0.14.0"
+ttf-parser = "0.25"
 walkdir = "2.5"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

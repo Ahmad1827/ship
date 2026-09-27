@@ -10,11 +10,11 @@ use clap::Parser;
 use colored::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use builder::{auto_build, TargetPlatform};
 use cli::Cli;
-use collector::assets::{AssetCollector, get_guaranteed_font};
+use collector::assets::AssetCollector;
 use collector::dll::LibraryResolver;
 use config::Config;
 use packager::StagingBuilder;
@@ -114,8 +114,7 @@ fn main() -> Result<()> {
         &config.asset_dirs,
         &args.extra_assets,
     );
-
-    let valid_font = get_guaranteed_font();
+    let referenced_fonts = asset_collector.detect_referenced_fonts(project_root);
 
     let fallback_label = format!("{}-{:?}", app_name, target_platform).to_lowercase();
     let zip_label = args.name.as_deref().unwrap_or(&fallback_label);
@@ -125,7 +124,7 @@ fn main() -> Result<()> {
     staging.copy_libraries(&libraries_list)?;
     staging.copy_assets(asset_collector.directories())?;
     staging.copy_loose_files(asset_collector.files())?;
-    staging.enforce_resources(&valid_font)?;
+    staging.enforce_fonts(&referenced_fonts)?;
 
     if args.single {
         println!("{} Creating standalone single executable...", "⚡".bright_yellow());

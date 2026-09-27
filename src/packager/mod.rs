@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::collector::font;
+
 pub struct StagingBuilder<'a> {
     staging_dir: PathBuf,
     output_dir: &'a Path,
@@ -93,27 +95,9 @@ impl<'a> StagingBuilder<'a> {
         Ok(())
     }
 
-    pub fn enforce_resources(&self, valid_font: &Path) -> Result<()> {
-        let res_dir = self.staging_dir.join("Resources");
-        fs::create_dir_all(&res_dir)?;
-        
-        let target_font = res_dir.join("font.ttf");
-        if !target_font.exists() {
-            fs::copy(valid_font, &target_font)?;
-        }
-        
-        let root_font = self.staging_dir.join("font.ttf");
-        if !root_font.exists() {
-            fs::copy(valid_font, &root_font)?;
-        }
-
-        let arial_font = self.staging_dir.join("arial.ttf");
-        if !arial_font.exists() {
-            fs::copy(valid_font, &arial_font)?;
-        }
-        
-        println!("  {} Enforced verified complete TrueType font in staging directories", "✔".green());
-        Ok(())
+    /// Replaces broken fonts and puts a working font everywhere the app might look.
+    pub fn enforce_fonts(&self, referenced_fonts: &[String]) -> Result<()> {
+        font::enforce_fonts(&self.staging_dir, referenced_fonts)
     }
 
     pub fn bundle_zip(&self, custom_name: Option<&str>) -> Result<PathBuf> {
