@@ -1,5 +1,6 @@
 pub mod single_file;
 pub mod zip;
+pub mod archive;
 
 use anyhow::{Context, Result};
 use colored::*;
