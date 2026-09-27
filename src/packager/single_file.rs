@@ -172,7 +172,83 @@ fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
     None
 }
 
+const DECOMPRESSOR_C_SOURCE: &str = r#"
+#include <stddef.h>
+#include <string.h>
+
+int ship_lz4_decompress(const unsigned char *src, size_t src_len, unsigned char *dest, size_t dest_len) {
+    size_t src_pos = 0;
+    size_t dest_pos = 0;
+
+    while (src_pos < src_len && dest_pos < dest_len) {
+        unsigned char token = src[src_pos++];
+        size_t lit_len = token >> 4;
+
+        if (lit_len == 15) {
+            unsigned char s = 0;
+            do {
+                if (src_pos >= src_len) return -1;
+                s = src[src_pos++];
+                lit_len += s;
+            } while (s == 255);
+        }
+
+        if (src_pos + lit_len > src_len || dest_pos + lit_len > dest_len) return -2;
+        memcpy(dest + dest_pos, src + src_pos, lit_len);
+        src_pos += lit_len;
+        dest_pos += lit_len;
+
+        if (dest_pos >= dest_len) break;
+        if (src_pos + 2 > src_len) return -3;
+
+        unsigned short offset = (unsigned short)(src[src_pos] | (src[src_pos + 1] << 8));
+        src_pos += 2;
+        if (offset == 0 || (size_t)offset > dest_pos) return -4;
+
+        size_t match_len = (token & 0x0F) + 4;
+        if (match_len == 19) {
+            unsigned char s = 0;
+            do {
+                if (src_pos >= src_len) return -5;
+                s = src[src_pos++];
+                match_len += s;
+            } while (s == 255);
+        }
+
+        if (dest_pos + match_len > dest_len) return -6;
+        for (size_t i = 0; i < match_len; i++) {
+            dest[dest_pos] = dest[dest_pos - offset];
+            dest_pos++;
+        }
+    }
+
+    return (dest_pos == dest_len) ? 0 : -7;
+}
+"#;
+
 pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str) -> Result<()> {
+    let target_bin_name = if main_exe_name.ends_with(".exe") {
+        main_exe_name.to_string()
+    } else {
+        format!("{}.exe", main_exe_name)
+    };
+
+    let pthread_candidates = [
+        "/usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll",
+        "/usr/lib/gcc/x86_64-w64-mingw32/13-win32/libwinpthread-1.dll",
+        "/usr/lib/gcc/x86_64-w64-mingw32/12-win32/libwinpthread-1.dll",
+    ];
+    for p in &pthread_candidates {
+        let pth = Path::new(p);
+        if pth.is_file() {
+            let dest = staging_dir.join("libwinpthread-1.dll");
+            if !dest.exists() {
+                let _ = fs::copy(pth, dest);
+            }
+            break;
+        }
+    }
+
     let mut archive_builder = ArchiveBuilder::new();
 
     for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
@@ -207,6 +283,9 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
     );
     fs::write(&asm_file, asm_content)?;
 
+    let lz4_file = temp_build.join("lz4_stub.c");
+    fs::write(&lz4_file, DECOMPRESSOR_C_SOURCE)?;
+
     let c_file = temp_build.join("stub.c");
     let c_content = format!(
         r#"#include <windows.h>
@@ -218,6 +297,20 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
 
 extern const unsigned char ship_payload_start[];
 extern const unsigned char ship_payload_end[];
+extern int ship_lz4_decompress(const unsigned char *src, size_t src_len, unsigned char *dest, size_t dest_len);
+
+static void log_debug(const char* msg) {{
+    char temp[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp);
+    char log_path[MAX_PATH];
+    snprintf(log_path, MAX_PATH, "%sship_debug.log", temp);
+    FILE* f = fopen(log_path, "a");
+    if (f) {{
+        fputs(msg, f);
+        fputc('\n', f);
+        fclose(f);
+    }}
+}}
 
 static unsigned int calc_crc32(const unsigned char *data, size_t len) {{
     unsigned int crc = 0xFFFFFFFF;
@@ -243,6 +336,8 @@ static void create_parent_dirs(char* path) {{
 }}
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {{
+    log_debug("=== Ship Stub Launch ===");
+
     char temp[MAX_PATH];
     GetTempPathA(MAX_PATH, temp);
 
@@ -254,7 +349,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     snprintf(hash_path, MAX_PATH, "%s/.ship_hash", app_dir);
 
     char exe_path[MAX_PATH];
-    snprintf(exe_path, MAX_PATH, "%s/{main_exe_name}", app_dir);
+    snprintf(exe_path, MAX_PATH, "%s/%s", app_dir, "{target_bin_name}");
 
     int need_extract = 1;
     FILE* hf = fopen(hash_path, "r");
@@ -269,6 +364,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
                 DWORD attr = GetFileAttributesA(exe_path);
                 if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {{
                     need_extract = 0;
+                    log_debug("Payload hash match: skipping extraction");
                 }}
             }}
         }}
@@ -276,16 +372,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     }}
 
     if (need_extract) {{
+        log_debug("Extracting payload...");
         const unsigned char* p = ship_payload_start;
         const unsigned char* end_ptr = ship_payload_end;
 
         if ((size_t)(end_ptr - p) < 12 || memcmp(p, "SHIP", 4) != 0) {{
+            log_debug("ERROR: Corrupted header");
+            MessageBoxA(NULL, "Corrupted binary package header.", "Ship Launch Error", MB_OK | MB_ICONERROR);
             return 1;
         }}
 
-        p += 4; // magic
-        p += 2; // version
-        p += 2; // reserved
+        p += 4;
+        p += 2;
+        p += 2;
 
         unsigned int file_count = 0;
         memcpy(&file_count, p, 4);
@@ -295,7 +394,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         for (unsigned int i = 0; i < file_count; i++) {{
             unsigned short plen = 0;
             memcpy(&plen, cur, 2);
-            cur += 2 + plen + 8 + 8 + 4;
+            cur += 2 + plen + 8 + 8 + 8 + 4;
         }}
         const unsigned char* data_start = cur;
 
@@ -312,8 +411,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             }}
             cur += path_len;
 
-            unsigned long long size = 0;
-            memcpy(&size, cur, 8);
+            unsigned long long uncomp_sz = 0;
+            memcpy(&uncomp_sz, cur, 8);
+            cur += 8;
+
+            unsigned long long comp_sz = 0;
+            memcpy(&comp_sz, cur, 8);
             cur += 8;
 
             unsigned long long offset = 0;
@@ -324,9 +427,33 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             memcpy(&expected_crc, cur, 4);
             cur += 4;
 
-            const unsigned char* file_bytes = data_start + offset;
-            if (calc_crc32(file_bytes, (size_t)size) != expected_crc) {{
+            const unsigned char* comp_bytes = data_start + offset;
+            unsigned char* uncomp_bytes = (unsigned char*)malloc((size_t)uncomp_sz);
+            if (!uncomp_bytes && uncomp_sz > 0) {{
+                log_debug("ERROR: Memory allocation failed");
+                MessageBoxA(NULL, "Memory allocation failed during decompression.", "Ship Error", MB_OK | MB_ICONERROR);
                 return 2;
+            }}
+
+            if (uncomp_sz > 0) {{
+                int err = ship_lz4_decompress(comp_bytes, (size_t)comp_sz, uncomp_bytes, (size_t)uncomp_sz);
+                if (err != 0) {{
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Failed decompressing '%s' (Error %d)", rel_path, err);
+                    log_debug(msg);
+                    MessageBoxA(NULL, msg, "Ship Decompression Error", MB_OK | MB_ICONERROR);
+                    free(uncomp_bytes);
+                    return 3;
+                }}
+
+                if (calc_crc32(uncomp_bytes, (size_t)uncomp_sz) != expected_crc) {{
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "CRC32 mismatch for '%s'", rel_path);
+                    log_debug(msg);
+                    MessageBoxA(NULL, msg, "Ship Integrity Error", MB_OK | MB_ICONERROR);
+                    free(uncomp_bytes);
+                    return 4;
+                }}
             }}
 
             char out_path[MAX_PATH];
@@ -336,8 +463,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             HANDLE hFile = CreateFileA(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) {{
                 DWORD written = 0;
-                WriteFile(hFile, file_bytes, (DWORD)size, &written, NULL);
+                if (uncomp_sz > 0) {{
+                    WriteFile(hFile, uncomp_bytes, (DWORD)uncomp_sz, &written, NULL);
+                }}
                 CloseHandle(hFile);
+            }}
+
+            if (uncomp_bytes) {{
+                free(uncomp_bytes);
             }}
         }}
 
@@ -346,7 +479,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             fputs(SHIP_BUILD_HASH, out_hf);
             fclose(out_hf);
         }}
+        log_debug("Extraction complete.");
     }}
+
+    char cmd_line[MAX_PATH * 2];
+    snprintf(cmd_line, sizeof(cmd_line), "\"%s\"", exe_path);
 
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -354,13 +491,33 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    if (CreateProcessA(exe_path, GetCommandLineA(), NULL, NULL, FALSE, 0x08000000, NULL, app_dir, &si, &pi)) {{
+    log_debug("Spawning child process...");
+    if (CreateProcessA(exe_path, cmd_line, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {{
         WaitForSingleObject(pi.hProcess, INFINITE);
         DWORD code = 0;
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+
+        char exit_msg[128];
+        snprintf(exit_msg, sizeof(exit_msg), "Process finished with exit code: %lu", code);
+        log_debug(exit_msg);
+
+        if (code != 0) {{
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                "Application exited with code: 0x%lX (%lu)\n\n"
+                "If this is 0xC0000135, a required DLL is missing.\n"
+                "Path: %s",
+                code, code, exe_path);
+            MessageBoxA(NULL, msg, "Ship Runtime Alert", MB_OK | MB_ICONERROR);
+        }}
         return (int)code;
+    }} else {{
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to launch process '%s' (Error %lu)", exe_path, GetLastError());
+        log_debug(msg);
+        MessageBoxA(NULL, msg, "Ship Execution Error", MB_OK | MB_ICONERROR);
     }}
 
     return 1;
@@ -385,29 +542,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         }
     }
 
-    let manifest_file = temp_build.join("app.manifest");
-    let manifest_content = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Ship.App" type="win32"/>
-  <dependency>
-    <dependentAssembly>
-      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
-    </dependentAssembly>
-  </dependency>
-  <application xmlns="urn:schemas-microsoft-com:asm.v3">
-    <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
-    </windowsSettings>
-  </application>
-</assembly>
-"#;
-    fs::write(&manifest_file, manifest_content)?;
-
     let rc_file = temp_build.join("resource.rc");
     let rc_content = format!(
         r#"1 ICON "icon.ico"
-1 24 "app.manifest"
 
 1 VERSIONINFO
 FILEVERSION 1,0,0,0
@@ -450,7 +587,7 @@ END
         .arg("-o")
         .arg("resource.o")
         .status()
-        .context("Failed to invoke windres for icon, manifest, and version resources")?;
+        .context("Failed to invoke windres for icon and version resources")?;
 
     if !windres_status.success() {
         return Err(anyhow!("windres failed to compile resource file"));
@@ -462,10 +599,15 @@ END
 
     let status = Command::new("x86_64-w64-mingw32-gcc")
         .arg("-O2")
+        .arg("-static")
+        .arg("-static-libgcc")
         .arg("-mwindows")
         .arg(&asm_file)
         .arg(&c_file)
+        .arg(&lz4_file)
         .arg(&res_file)
+        .arg("-luser32")
+        .arg("-lkernel32")
         .arg("-o")
         .arg(output_exe)
         .status()
