@@ -10,6 +10,8 @@ use walkdir::WalkDir;
 
 use crate::builder::TargetPlatform;
 use crate::collector::font;
+use crate::project::ProjectConfig;
+use single_file::StubOptions;
 
 pub struct StagingBuilder<'a> {
     staging_dir: PathBuf,
@@ -98,9 +100,32 @@ impl<'a> StagingBuilder<'a> {
         Ok(())
     }
 
-    /// Replaces broken fonts and puts a working font everywhere the app might look.
-    pub fn enforce_fonts(&self, referenced_fonts: &[String]) -> Result<()> {
-        font::enforce_fonts(&self.staging_dir, referenced_fonts)
+    /// Removes everything under the `exclude` entries of ship.toml.
+    pub fn apply_excludes(&self, project: &ProjectConfig) -> Result<()> {
+        if project.exclude.is_empty() {
+            return Ok(());
+        }
+        let mut walker = WalkDir::new(&self.staging_dir).min_depth(1).into_iter();
+        while let Some(entry) = walker.next() {
+            let entry = entry?;
+            let rel = entry.path().strip_prefix(&self.staging_dir)?.to_string_lossy().replace('\\', "/");
+            if !project.is_excluded(&rel) {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                fs::remove_dir_all(entry.path())?;
+                walker.skip_current_dir();
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+            println!("  {} Excluded: {}", "✂".bright_black(), rel.bright_black());
+        }
+        Ok(())
+    }
+
+    /// Adds a fallback font where the app expects one but none was packaged.
+    pub fn enforce_fonts(&self, referenced_fonts: &[String], common_locations: bool) -> Result<()> {
+        font::enforce_fonts(&self.staging_dir, referenced_fonts, common_locations)
     }
 
     pub fn bundle_zip(&self, custom_name: Option<&str>) -> Result<PathBuf> {
@@ -113,7 +138,7 @@ impl<'a> StagingBuilder<'a> {
         Ok(zip_path)
     }
 
-    pub fn bundle_single_file(&self, custom_name: Option<&str>) -> Result<PathBuf> {
+    pub fn bundle_single_file(&self, custom_name: Option<&str>, opts: &StubOptions) -> Result<PathBuf> {
         let base = custom_name.unwrap_or(&self.app_name);
         let exe_name = match self.target {
             TargetPlatform::Windows => format!("{}-standalone.exe", base),
@@ -124,7 +149,7 @@ impl<'a> StagingBuilder<'a> {
         match self.target {
             TargetPlatform::Windows => {
                 let main_bin = self.main_exe_name.as_deref().unwrap_or("app.exe");
-                single_file::build_standalone_exe(&self.staging_dir, &output_exe, main_bin)?;
+                single_file::build_standalone_exe(&self.staging_dir, &output_exe, main_bin, opts)?;
             }
             TargetPlatform::Linux => {
                 let main_bin = self.main_exe_name.as_deref().unwrap_or("app");

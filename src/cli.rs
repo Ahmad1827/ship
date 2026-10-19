@@ -8,11 +8,11 @@ pub struct Cli {
     #[arg(help = "Optional explicit binary path (if omitted, auto-builds current project)")]
     pub binary: Option<PathBuf>,
 
-    #[arg(short, long, default_value = "windows", help = "Target platform: windows or linux")]
-    pub target: String,
+    #[arg(short, long, help = "Target platform: windows or linux [default: windows]")]
+    pub target: Option<String>,
 
-    #[arg(short, long, default_value = "dist", help = "Output directory")]
-    pub output: PathBuf,
+    #[arg(short, long, help = "Output directory [default: dist]")]
+    pub output: Option<PathBuf>,
 
     #[arg(short, long, help = "Custom name for output file")]
     pub name: Option<String>,
@@ -28,4 +28,16 @@ pub struct Cli {
 
     #[arg(short = 'a', long, help = "Additional asset folders to include")]
     pub extra_assets: Vec<PathBuf>,
+
+    #[arg(long, help = "Build a console app on Windows (keeps the terminal attached)")]
+    pub console: bool,
+
+    #[arg(long, help = "Show what would be packaged (still builds) without creating a package")]
+    pub dry_run: bool,
+
+    #[arg(long, help = "Fail if any required library cannot be found")]
+    pub strict: bool,
+
+    #[arg(long, help = "Write a commented ship.toml template in the current directory")]
+    pub init: bool,
 }

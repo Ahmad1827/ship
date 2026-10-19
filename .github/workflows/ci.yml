@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 zlib1g-dev unzip
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Integration tests
+        run: SHIP_OUT_DIR="$PWD/win-out" tests/integration.sh
+
+      - name: Upload Windows test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-standalone
+          path: win-out/
+
+  # The Windows standalone is cross-built on Linux above; run it on real Windows.
+  windows-run:
+    needs: linux
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-standalone
+
+      - name: Run standalone executable
+        shell: pwsh
+        run: |
+          $out = (& .\WinApp-standalone.exe "two words" x) -join "`n"
+          Write-Host "output: $out"
+          if ($LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
+          if (-not $out.Contains("asset=[hi from asset]")) { throw "asset not found" }
+          if (-not $out.Contains("args=2 [two words] [x]")) { throw "arguments not forwarded" }

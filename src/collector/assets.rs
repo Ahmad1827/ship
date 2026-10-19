@@ -65,6 +65,11 @@ impl AssetCollector {
             }
         }
 
+        // "assets/levels" is already copied as part of "assets"; bundling it again would
+        // duplicate it at the package root.
+        let all_dirs = found_dirs.clone();
+        found_dirs.retain(|dir| !all_dirs.iter().any(|other| other != dir && dir.starts_with(other)));
+
         Self { found_dirs, found_files }
     }
 

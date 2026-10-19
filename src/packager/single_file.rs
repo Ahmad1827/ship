@@ -8,6 +8,18 @@ use std::process::Command;
 use walkdir::WalkDir;
 
 use super::archive::{stable_hash, ArchiveBuilder};
+use crate::project::ProjectConfig;
+
+/// Windows-only knobs for the standalone launcher.
+pub struct StubOptions<'a> {
+    pub console: bool,
+    pub project: &'a ProjectConfig,
+}
+
+/// Escapes a value for a double-quoted string in a .rc file.
+fn rc_escape(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
 
 enum IconCandidate {
     Ico(PathBuf),
@@ -275,6 +287,9 @@ pub fn build_linux_standalone_exe(
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <ftw.h>
 
 #define SHIP_BUILD_HASH "{build_hash}"
 
@@ -304,14 +319,70 @@ static void create_parent_dirs(char* path) {{
     }}
 }}
 
+/* Per-user cache dir. Never a shared world-writable path: another user could pre-create
+   the extraction dir there with their own binary and a matching .ship_hash. */
+static int prepare_base_dir(char *out, size_t len) {{
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && xdg[0] == '/') {{
+        mkdir(xdg, 0700);
+        snprintf(out, len, "%s/ship", xdg);
+    }} else if (home && home[0] == '/') {{
+        snprintf(out, len, "%s/.cache", home);
+        mkdir(out, 0700);
+        snprintf(out, len, "%s/.cache/ship", home);
+    }} else {{
+        const char *tmp = getenv("TMPDIR");
+        if (!tmp || !*tmp) tmp = "/tmp";
+        snprintf(out, len, "%s/ship-%u", tmp, (unsigned)getuid());
+    }}
+    mkdir(out, 0700);
+
+    struct stat st;
+    if (lstat(out, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 022)) {{
+        fprintf(stderr, "Error: refusing to use unsafe cache dir %s\n", out);
+        return -1;
+    }}
+    return 0;
+}}
+
+static int remove_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {{
+    (void)sb; (void)flag; (void)ftw;
+    return remove(path);
+}}
+
+static int is_build_hash(const char *s) {{
+    if (strlen(s) != 16) return 0;
+    for (; *s; s++) if (!isxdigit((unsigned char)*s)) return 0;
+    return 1;
+}}
+
+/* Deletes extractions left by older builds of this app (<prefix><other hash>). */
+static void remove_stale_extractions(const char *base, const char *prefix) {{
+    DIR *d = opendir(base);
+    if (!d) return;
+    size_t plen = strlen(prefix);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {{
+        const char *hash = e->d_name + plen;
+        if (strncmp(e->d_name, prefix, plen) == 0 && is_build_hash(hash) && strcmp(hash, SHIP_BUILD_HASH) != 0) {{
+            char stale[1024];
+            snprintf(stale, sizeof(stale), "%s/%s", base, e->d_name);
+            nftw(stale, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+        }}
+    }}
+    closedir(d);
+}}
+
 int main(int argc, char **argv) {{
-    const char *tmp_root = getenv("TMPDIR");
-    if (!tmp_root || !*tmp_root) {{
-        tmp_root = "/tmp";
+    char base_dir[1024];
+    if (prepare_base_dir(base_dir, sizeof(base_dir)) != 0) {{
+        return 1;
     }}
 
+    const char *dir_prefix = "{main_exe_name}_";
     char app_dir[1024];
-    snprintf(app_dir, sizeof(app_dir), "%s/ShipApp_%s_%s", tmp_root, "{main_exe_name}", SHIP_BUILD_HASH);
+    snprintf(app_dir, sizeof(app_dir), "%s/%s%s", base_dir, dir_prefix, SHIP_BUILD_HASH);
     mkdir(app_dir, 0755);
 
     char hash_path[1024];
@@ -429,6 +500,7 @@ int main(int argc, char **argv) {{
             fputs(SHIP_BUILD_HASH, out_hf);
             fclose(out_hf);
         }}
+        remove_stale_extractions(base_dir, dir_prefix);
     }}
 
     char ld_env[2048];
@@ -462,6 +534,8 @@ int main(int argc, char **argv) {{
 
     let status = Command::new("gcc")
         .arg("-O2")
+        // Paths are bounded at 1 KB; gcc's "may be truncated" notes are just noise for users.
+        .arg("-Wno-format-truncation")
         .arg(&asm_file)
         .arg(&c_file)
         .arg(&lz4_file)
@@ -479,7 +553,7 @@ int main(int argc, char **argv) {{
     Ok(())
 }
 
-pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str) -> Result<()> {
+pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str, opts: &StubOptions) -> Result<()> {
     let target_bin_name = if main_exe_name.ends_with(".exe") {
         main_exe_name.to_string()
     } else {
@@ -515,6 +589,7 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
     let archive_bytes = archive_builder.build()?;
 
     let build_hash = stable_hash(&archive_bytes);
+    let console = if opts.console { 1 } else { 0 };
 
     let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build");
     fs::create_dir_all(&temp_build)?;
@@ -545,12 +620,15 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
 #include <string.h>
 
 #define SHIP_BUILD_HASH "{build_hash}"
+#define SHIP_CONSOLE {console}
 
 extern const unsigned char ship_payload_start[];
 extern const unsigned char ship_payload_end[];
 extern int ship_lz4_decompress(const unsigned char *src, size_t src_len, unsigned char *dest, size_t dest_len);
 
+/* Only with SHIP_DEBUG set: otherwise every launch would grow %TEMP%\ship_debug.log forever. */
 static void log_debug(const char* msg) {{
+    if (!getenv("SHIP_DEBUG")) return;
     char temp[MAX_PATH];
     GetTempPathA(MAX_PATH, temp);
     char log_path[MAX_PATH];
@@ -586,6 +664,62 @@ static void create_parent_dirs(char* path) {{
     }}
 }}
 
+static void delete_tree(const char* dir) {{
+    char pattern[MAX_PATH];
+    snprintf(pattern, MAX_PATH, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {{
+        do {{
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            char child[MAX_PATH];
+            snprintf(child, MAX_PATH, "%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {{
+                RemoveDirectoryA(child); /* never follow junctions/symlinks */
+                DeleteFileA(child);
+            }} else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {{
+                delete_tree(child);
+            }} else {{
+                SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL);
+                DeleteFileA(child);
+            }}
+        }} while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }}
+    RemoveDirectoryA(dir);
+}}
+
+static int is_build_hash(const char* s) {{
+    if (strlen(s) != 16) return 0;
+    for (; *s; s++) {{
+        char c = *s;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return 0;
+    }}
+    return 1;
+}}
+
+/* Deletes extractions left by older builds of this app (<prefix><other hash>). Files of a
+   still-running old instance are locked and simply stay until the next launch. */
+static void remove_stale_extractions(const char* temp, const char* prefix) {{
+    char pattern[MAX_PATH];
+    snprintf(pattern, MAX_PATH, "%s%s*", temp, prefix);
+    size_t plen = strlen(prefix);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {{
+        const char* hash = fd.cFileName + plen;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            && is_build_hash(hash) && strcmp(hash, SHIP_BUILD_HASH) != 0) {{
+            char stale[MAX_PATH];
+            snprintf(stale, MAX_PATH, "%s%s", temp, fd.cFileName);
+            delete_tree(stale);
+        }}
+    }} while (FindNextFileA(h, &fd));
+    FindClose(h);
+}}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {{
     log_debug("=== Ship Stub Launch ===");
 
@@ -593,7 +727,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     GetTempPathA(MAX_PATH, temp);
 
     char app_dir[MAX_PATH];
-    snprintf(app_dir, MAX_PATH, "%sShipApp_%s_%s", temp, "{main_exe_name}", SHIP_BUILD_HASH);
+    const char* dir_prefix = "ShipApp_{main_exe_name}_";
+    snprintf(app_dir, MAX_PATH, "%s%s%s", temp, dir_prefix, SHIP_BUILD_HASH);
     CreateDirectoryA(app_dir, NULL);
 
     char hash_path[MAX_PATH];
@@ -731,10 +866,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             fclose(out_hf);
         }}
         log_debug("Extraction complete.");
+        remove_stale_extractions(temp, dir_prefix);
     }}
 
-    char cmd_line[MAX_PATH * 2];
-    snprintf(cmd_line, sizeof(cmd_line), "\"%s\"", exe_path);
+    /* Forward the stub's own arguments; lpCmdLine excludes the program name. */
+    static char cmd_line[32768];
+    snprintf(cmd_line, sizeof(cmd_line), "\"%s\" %s", exe_path, lpCmdLine ? lpCmdLine : "");
 
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -754,7 +891,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
         snprintf(exit_msg, sizeof(exit_msg), "Process finished with exit code: %lu", code);
         log_debug(exit_msg);
 
-        if (code != 0) {{
+        if (SHIP_CONSOLE && code != 0) {{
+            if (code >= 0xC0000000UL) {{
+                fprintf(stderr, "ship: application crashed with 0x%lX%s\n", code,
+                        code == 0xC0000135UL ? " (a required DLL is missing)" : "");
+            }}
+        }} else if (code >= 0xC0000000UL) {{
+            /* Only NTSTATUS failures (crash, missing DLL); a plain `return 1` is the app's business. */
             char msg[512];
             snprintf(msg, sizeof(msg),
                 "Application exited with code: 0x%lX (%lu)\n\n"
@@ -778,14 +921,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     fs::write(&c_file, c_content)?;
 
     let icon_dest = temp_build.join("icon.ico");
-    match find_icon_candidate(staging_dir) {
+    let icon = match &opts.project.icon {
+        Some(path) if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("png")) => Some(IconCandidate::Png(path.clone())),
+        Some(path) => Some(IconCandidate::Ico(path.clone())),
+        None => find_icon_candidate(staging_dir),
+    };
+    match icon {
         Some(IconCandidate::Ico(ico_path)) => {
             println!("{} Found icon file: {}", "🎨".bright_yellow(), ico_path.display().to_string().bright_white());
-            let _ = fs::copy(&ico_path, &icon_dest);
+            fs::copy(&ico_path, &icon_dest).with_context(|| format!("Failed to read icon {:?}", ico_path))?;
         }
         Some(IconCandidate::Png(png_path)) => {
             println!("{} Converting PNG icon: {}", "🎨".bright_yellow(), png_path.display().to_string().bright_white());
-            let _ = convert_png_to_ico(&png_path, &icon_dest);
+            convert_png_to_ico(&png_path, &icon_dest)?;
         }
         None => {
             println!("{} No icon found, embedding default icon", "🎨".bright_cyan());
@@ -794,12 +942,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     }
 
     let rc_file = temp_build.join("resource.rc");
+    let project = opts.project;
+    let app_name = rc_escape(main_exe_name.trim_end_matches(".exe"));
+    let [v1, v2, v3, v4] = project.version_numbers();
+    let version = format!("{}.{}.{}.{}", v1, v2, v3, v4);
+    let product = project.name.as_deref().map(rc_escape).unwrap_or_else(|| app_name.clone());
+    let description = project.description.as_deref().map(rc_escape).unwrap_or_else(|| product.clone());
+    let company = project.company.as_deref().map(rc_escape).unwrap_or_default();
+    let copyright = project.copyright.as_deref().map(rc_escape).unwrap_or_default();
     let rc_content = format!(
         r#"1 ICON "icon.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION {v1},{v2},{v3},{v4}
+PRODUCTVERSION {v1},{v2},{v3},{v4}
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -810,14 +966,14 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "Ship"
-            VALUE "FileDescription", "Glad tidings to the strangers"
-            VALUE "FileVersion", "1.0.0.0"
-            VALUE "InternalName", "{main_exe_name}"
-            VALUE "LegalCopyright", "Copyright (c) 2026"
-            VALUE "OriginalFilename", "{main_exe_name}.exe"
-            VALUE "ProductName", "{main_exe_name}"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "CompanyName", "{company}"
+            VALUE "FileDescription", "{description}"
+            VALUE "FileVersion", "{version}"
+            VALUE "InternalName", "{app_name}"
+            VALUE "LegalCopyright", "{copyright}"
+            VALUE "OriginalFilename", "{app_name}.exe"
+            VALUE "ProductName", "{product}"
+            VALUE "ProductVersion", "{version}"
         END
     END
     BLOCK "VarFileInfo"
@@ -852,7 +1008,7 @@ END
         .arg("-O2")
         .arg("-static")
         .arg("-static-libgcc")
-        .arg("-mwindows")
+        .arg(if opts.console { "-mconsole" } else { "-mwindows" })
         .arg(&asm_file)
         .arg(&c_file)
         .arg(&lz4_file)

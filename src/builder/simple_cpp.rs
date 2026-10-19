@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
-use super::{BuildResult, TargetPlatform};
+use super::{BuildOptions, BuildResult, TargetPlatform};
 use crate::collector::assets::is_ignored_dir;
 
 pub fn find_source_files(dir: &Path) -> Vec<PathBuf> {
@@ -22,7 +22,7 @@ pub fn find_source_files(dir: &Path) -> Vec<PathBuf> {
     sources
 }
 
-pub fn build_direct(project_dir: &Path, sources: &[PathBuf], target: TargetPlatform) -> Result<BuildResult> {
+pub fn build_direct(project_dir: &Path, sources: &[PathBuf], target: TargetPlatform, opts: &BuildOptions) -> Result<BuildResult> {
     let project_name = project_dir
         .file_name()
         .and_then(|s| s.to_str())
@@ -41,9 +41,12 @@ pub fn build_direct(project_dir: &Path, sources: &[PathBuf], target: TargetPlatf
     let mut cmd = Command::new(compiler);
     cmd.current_dir(project_dir);
     cmd.arg("-O3");
+    cmd.args(&opts.cflags);
 
     if target == TargetPlatform::Windows {
-        cmd.arg("-mwindows");
+        if !opts.console {
+            cmd.arg("-mwindows");
+        }
 
         for entry in WalkDir::new(project_dir).max_depth(2).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
@@ -72,6 +75,10 @@ pub fn build_direct(project_dir: &Path, sources: &[PathBuf], target: TargetPlatf
 
     for src in sources {
         cmd.arg(src);
+    }
+    // Libraries go after the sources so the linker can resolve their symbols.
+    for lib in &opts.link {
+        cmd.arg(format!("-l{}", lib.trim_start_matches("-l")));
     }
     cmd.arg("-o").arg(&output_bin);
 
@@ -103,7 +110,7 @@ fn extract_cmake_target_name(project_dir: &Path) -> Option<String> {
     None
 }
 
-pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildResult> {
+pub fn build_cmake(project_dir: &Path, target: TargetPlatform, opts: &BuildOptions) -> Result<BuildResult> {
     let subfolder = match target {
         TargetPlatform::Windows => "build-ship-windows",
         TargetPlatform::Linux => "build-ship-linux",
@@ -119,7 +126,9 @@ pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildRe
         config_cmd.arg("-DCMAKE_SYSTEM_NAME=Windows");
         config_cmd.arg("-DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc");
         config_cmd.arg("-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++");
-        config_cmd.arg("-DCMAKE_EXE_LINKER_FLAGS=-mwindows");
+        if !opts.console {
+            config_cmd.arg("-DCMAKE_EXE_LINKER_FLAGS=-mwindows");
+        }
 
         let cmakelists = fs::read_to_string(project_dir.join("CMakeLists.txt")).unwrap_or_default();
         if cmakelists.contains("SFML") {
@@ -201,14 +210,16 @@ pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildRe
     Err(anyhow!("Could not locate built binary in {:?}", build_dir))
 }
 
-pub fn build_make(project_dir: &Path, target: TargetPlatform) -> Result<BuildResult> {
+pub fn build_make(project_dir: &Path, target: TargetPlatform, opts: &BuildOptions) -> Result<BuildResult> {
     let mut cmd = Command::new("make");
     cmd.current_dir(project_dir);
 
     if target == TargetPlatform::Windows {
         cmd.arg("CC=x86_64-w64-mingw32-gcc");
         cmd.arg("CXX=x86_64-w64-mingw32-g++");
-        cmd.arg("LDFLAGS=-mwindows");
+        if !opts.console {
+            cmd.arg("LDFLAGS=-mwindows");
+        }
     }
 
     let status = cmd.status().context("Failed to run make")?;

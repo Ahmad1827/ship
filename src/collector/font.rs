@@ -59,7 +59,7 @@ pub fn fallback_font_bytes() -> Vec<u8> {
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/mnt/c/Windows/Fonts/arial.ttf",
+        // Not C:\Windows\Fonts: those fonts (Arial etc.) may not be redistributed.
     ];
     for c in candidates {
         if let Ok(data) = fs::read(c) {
@@ -88,9 +88,21 @@ pub fn sanitize_relative(raw: &str) -> Option<PathBuf> {
     if out.as_os_str().is_empty() { None } else { Some(out) }
 }
 
-/// Adds the fallback font to every expected location that is still empty.
+/// Libraries that draw text from a font file the app has to ship itself.
+pub fn needs_font_file(library_names: &[&str]) -> bool {
+    library_names.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        ["sfml-graphics", "sdl2_ttf", "sdl3_ttf", "libfreetype", "freetype", "allegro_ttf"]
+            .iter()
+            .any(|lib| lower.contains(lib))
+    })
+}
+
+/// Adds the fallback font where the app expects one and it is still missing.
+/// `referenced` are font paths found in the source; `common_locations` also fills the usual
+/// guesses (font.ttf, assets/font.ttf, ...) for apps whose font paths we could not see.
 /// The app's own fonts always win: an existing file is never overwritten.
-pub fn enforce_fonts(staging_dir: &Path, referenced: &[String]) -> Result<()> {
+pub fn enforce_fonts(staging_dir: &Path, referenced: &[String], common_locations: bool) -> Result<()> {
     let fallback = fallback_font_bytes();
     if !is_usable_font(&fallback) {
         anyhow::bail!("The fallback font is not a valid font. Replace resources/fallback.ttf and rebuild ship.");
@@ -109,7 +121,11 @@ pub fn enforce_fonts(staging_dir: &Path, referenced: &[String]) -> Result<()> {
     }
 
     // 2. Common locations + every font path the source code mentions.
-    let mut targets: Vec<PathBuf> = COMMON_FONT_TARGETS.iter().map(PathBuf::from).collect();
+    let mut targets: Vec<PathBuf> = if common_locations {
+        COMMON_FONT_TARGETS.iter().map(PathBuf::from).collect()
+    } else {
+        Vec::new()
+    };
     for r in referenced {
         if let Some(rel) = sanitize_relative(r) {
             if let Some(name) = rel.file_name() {
@@ -120,6 +136,10 @@ pub fn enforce_fonts(staging_dir: &Path, referenced: &[String]) -> Result<()> {
     }
     targets.sort();
     targets.dedup();
+
+    if targets.is_empty() {
+        return Ok(());
+    }
 
     let mut added = 0;
     for rel in targets {
