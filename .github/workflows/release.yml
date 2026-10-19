@@ -1,0 +1,58 @@
+name: Release
+
+# Push a tag matching the Cargo.toml version to publish, e.g.:
+#   git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mingw-w64 zlib1g-dev unzip squashfs-tools desktop-file-utils osslsigncode
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, x86_64-pc-windows-gnu
+
+      # Static binary: runs on any x86_64 Linux distro and under WSL.
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Test the release binary
+        run: |
+          cargo test --locked
+          tests/integration.sh target/x86_64-unknown-linux-musl/release/ship
+
+      - name: Package
+        run: |
+          name="ship-${GITHUB_REF_NAME}-x86_64-linux"
+          mkdir "$name"
+          cp target/x86_64-unknown-linux-musl/release/ship README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ARCHIVE" "$ARCHIVE.sha256" \
+            --title "$GITHUB_REF_NAME" --generate-notes

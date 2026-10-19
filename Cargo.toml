@@ -2,6 +2,12 @@
 name = "ship"
 version = "0.1.0"
 edition = "2021"
+description = "Zero-config build, dependency harvester and single-file packager for native apps and indie games"
+license = "MIT"
+repository = "https://github.com/Ahmad1827/ship"
+readme = "README.md"
+keywords = ["packaging", "gamedev", "appimage", "mingw", "itch"]
+categories = ["command-line-utilities", "development-tools::build-utils", "game-development"]
 
 [dependencies]
 anyhow = "1.0"
@@ -17,3 +23,6 @@ toml = "0.8"
 ttf-parser = "0.25"
 walkdir = "2.5"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true

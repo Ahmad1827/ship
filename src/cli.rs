@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "ship")]
+#[command(name = "ship", version)]
 #[command(about = "One-command auto-build, DLL resolver and packager for itch.io / GitHub")]
 pub struct Cli {
     #[arg(help = "Optional explicit binary path (if omitted, auto-builds current project)")]
