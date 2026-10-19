@@ -1,82 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use colored::*;
-use std::env;
-use std::fs::{self, File};
-use std::io;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
-use zip::ZipArchive;
 use super::{BuildResult, TargetPlatform};
-
-fn get_ship_dir() -> Result<PathBuf> {
-    let home = env::var("HOME").context("HOME directory not found")?;
-    let path = PathBuf::from(home).join(".ship");
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-fn ensure_sfml_windows_sdk() -> Result<PathBuf> {
-    let ship_dir = get_ship_dir()?;
-    let sfml_dir = ship_dir.join("sfml-win");
-
-    if sfml_dir.exists() {
-        return Ok(sfml_dir);
-    }
-
-    println!("{} Auto-fetching SFML Windows SDK...", "⚡".bright_yellow());
-    let zip_path = ship_dir.join("sfml-win.zip");
-    let url = "https://github.com/SFML/SFML/releases/download/2.6.1/SFML-2.6.1-windows-gcc-13.1.0-mingw-64-bit.zip";
-
-    let curl_status = Command::new("curl")
-        .arg("-L")
-        .arg("-o")
-        .arg(&zip_path)
-        .arg(url)
-        .status()
-        .context("Failed to download SFML SDK via curl")?;
-
-    if !curl_status.success() {
-        return Err(anyhow!("Failed to download SFML Windows SDK"));
-    }
-
-    let file = File::open(&zip_path)?;
-    let mut archive = ZipArchive::new(file)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => ship_dir.join(path),
-            None => continue,
-        };
-
-        if file.is_dir() {
-            fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = File::create(&outpath)?;
-            io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
-    let _ = fs::remove_file(zip_path);
-
-    let extracted_folder = ship_dir.join("SFML-2.6.1");
-    if extracted_folder.exists() {
-        fs::rename(extracted_folder, &sfml_dir)?;
-    }
-
-    println!("{} SFML Windows SDK ready", "✔".green());
-    Ok(sfml_dir)
-}
+use crate::collector::assets::is_ignored_dir;
 
 pub fn find_source_files(dir: &Path) -> Vec<PathBuf> {
     let mut sources = Vec::new();
-    for entry in WalkDir::new(dir).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+    let walker = WalkDir::new(dir).max_depth(3).into_iter().filter_entry(|e| !is_ignored_dir(e));
+    for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -190,7 +123,7 @@ pub fn build_cmake(project_dir: &Path, target: TargetPlatform) -> Result<BuildRe
 
         let cmakelists = fs::read_to_string(project_dir.join("CMakeLists.txt")).unwrap_or_default();
         if cmakelists.contains("SFML") {
-            let sfml_path = ensure_sfml_windows_sdk()?;
+            let sfml_path = crate::sdk::ensure(&crate::sdk::SFML_MINGW)?;
             config_cmd.arg(format!("-DCMAKE_PREFIX_PATH={}", sfml_path.display()));
             config_cmd.arg(format!("-DSFML_DIR={}/lib/cmake/SFML", sfml_path.display()));
         }

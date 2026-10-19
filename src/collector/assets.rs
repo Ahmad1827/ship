@@ -1,6 +1,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
+
+/// True for build outputs and VCS dirs that must never be scanned for assets or sources.
+/// `target`/`dist` are common words (a "target" sprite folder), so they only count at the project root.
+pub fn is_ignored_dir(entry: &DirEntry) -> bool {
+    if !entry.file_type().is_dir() || entry.depth() == 0 {
+        return false;
+    }
+    let Some(name) = entry.file_name().to_str() else { return false };
+    matches!(name, ".git" | "node_modules" | "CMakeFiles" | "build")
+        || name.starts_with("build-")
+        || name.starts_with("build_")
+        || name.starts_with("cmake-build-")
+        || (entry.depth() == 1 && matches!(name, "target" | "dist"))
+}
 
 pub struct AssetCollector {
     found_dirs: Vec<PathBuf>,
@@ -12,13 +26,9 @@ impl AssetCollector {
         let mut found_dirs = Vec::new();
         let mut found_files = Vec::new();
 
-        for entry in WalkDir::new(project_dir).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+        let walker = WalkDir::new(project_dir).max_depth(4).into_iter().filter_entry(|e| !is_ignored_dir(e));
+        for entry in walker.filter_map(|e| e.ok()) {
             let path = entry.path();
-            let path_str = path.to_string_lossy();
-
-            if path_str.contains("build") || path_str.contains("target") || path_str.contains(".git") || path_str.contains("dist") {
-                continue;
-            }
 
             if entry.file_type().is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
@@ -70,16 +80,13 @@ impl AssetCollector {
     pub fn detect_referenced_fonts(&self, project_dir: &Path) -> Vec<String> {
         let mut referenced = Vec::new();
 
-        for entry in WalkDir::new(project_dir).into_iter().filter_map(|e| e.ok()) {
+        let walker = WalkDir::new(project_dir).into_iter().filter_entry(|e| !is_ignored_dir(e));
+        for entry in walker.filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
 
             let path = entry.path();
-            let p_str = path.to_string_lossy();
-            if p_str.contains("build") || p_str.contains("target") || p_str.contains(".git") || p_str.contains("dist") {
-                continue;
-            }
 
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             if !matches!(ext, "cpp" | "hpp" | "h" | "cc" | "cxx") {

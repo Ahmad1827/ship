@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
@@ -30,6 +30,8 @@ pub fn stable_hash(data: &[u8]) -> String {
     format!("{:016x}", hash)
 }
 
+// Rust-side reader mirroring the C stub's decoder; exercised by the tests.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEntry {
     pub path: String,
@@ -55,6 +57,7 @@ impl ArchiveBuilder {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn add_bytes(&mut self, rel_path: &str, data: Vec<u8>) {
         self.entries.push((rel_path.replace('\\', "/"), data));
     }
@@ -110,6 +113,7 @@ impl ArchiveBuilder {
     }
 }
 
+#[allow(dead_code)]
 pub struct ArchiveReader<'a> {
     data: &'a [u8],
     pub compression_type: u16,
@@ -117,6 +121,7 @@ pub struct ArchiveReader<'a> {
     data_start_offset: usize,
 }
 
+#[allow(dead_code)]
 impl<'a> ArchiveReader<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 12 {
@@ -239,4 +244,4 @@ mod tests {
         assert_eq!(stable_hash(b""), "cbf29ce484222325");
         assert_eq!(stable_hash(b"a"), "af63dc4c8601ec8c");
     }
-}
+}

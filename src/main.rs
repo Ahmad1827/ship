@@ -4,6 +4,7 @@ mod collector;
 mod config;
 mod packager;
 mod parser;
+mod sdk;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
     let mut resolved_libraries: HashMap<String, Option<PathBuf>> = HashMap::new();
     let mut to_scan: Vec<PathBuf> = vec![binary_path.clone()];
     let mut scanned: HashSet<PathBuf> = HashSet::new();
+    let mut os_libraries: HashSet<String> = HashSet::new();
 
     while let Some(current_file) = to_scan.pop() {
         if scanned.contains(&current_file) {
@@ -83,8 +85,14 @@ fn main() -> Result<()> {
                     BinaryFormat::Elf => config.is_system_so(&dep),
                 };
 
-                if !is_system && !resolved_libraries.contains_key(&dep) {
+                if !is_system && !resolved_libraries.contains_key(&dep) && !os_libraries.contains(&dep) {
                     let location = resolver.find_library(&dep);
+                    if matches!(format, BinaryFormat::Pe)
+                        && location.as_deref().map_or(false, |l| config.is_windows_system_location(l))
+                    {
+                        os_libraries.insert(dep);
+                        continue;
+                    }
                     if let Some(ref loc) = location {
                         if loc.is_file() {
                             to_scan.push(loc.clone());
