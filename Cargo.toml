@@ -1,5 +1,5 @@
 [package]
-name = "ship"
+name = "ships"
 version = "0.2.0"
 edition = "2021"
 description = "Zero-config build, dependency harvester and single-file packager for native apps and indie games"
@@ -8,6 +8,13 @@ repository = "https://github.com/Ahmad1827/ship"
 readme = "README.md"
 keywords = ["packaging", "gamedev", "appimage", "mingw", "itch"]
 categories = ["command-line-utilities", "development-tools::build-utils", "game-development"]
+# Only what's needed to build; the unused assets/default_font.ttf stays out of the crate.
+exclude = [".github/", "assets/"]
+
+# The package is "ships" on crates.io (the name "ship" is taken), but the command stays `ship`.
+[[bin]]
+name = "ship"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
