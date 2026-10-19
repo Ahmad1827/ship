@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::builder::TargetPlatform;
 use crate::collector::font;
 
 pub struct StagingBuilder<'a> {
@@ -15,10 +16,11 @@ pub struct StagingBuilder<'a> {
     output_dir: &'a Path,
     app_name: String,
     main_exe_name: Option<String>,
+    target: TargetPlatform,
 }
 
 impl<'a> StagingBuilder<'a> {
-    pub fn new(output_dir: &'a Path, app_name: &str) -> Result<Self> {
+    pub fn new(output_dir: &'a Path, app_name: &str, target: TargetPlatform) -> Result<Self> {
         fs::create_dir_all(output_dir)?;
         let staging_dir = output_dir.join(format!("{}_staging", app_name));
         if staging_dir.exists() {
@@ -31,6 +33,7 @@ impl<'a> StagingBuilder<'a> {
             output_dir,
             app_name: app_name.to_string(),
             main_exe_name: None,
+            target,
         })
     }
 
@@ -111,14 +114,23 @@ impl<'a> StagingBuilder<'a> {
     }
 
     pub fn bundle_single_file(&self, custom_name: Option<&str>) -> Result<PathBuf> {
-        let exe_name = match custom_name {
-            Some(name) => format!("{}-standalone.exe", name),
-            None => format!("{}-standalone.exe", self.app_name),
+        let base = custom_name.unwrap_or(&self.app_name);
+        let exe_name = match self.target {
+            TargetPlatform::Windows => format!("{}-standalone.exe", base),
+            TargetPlatform::Linux => format!("{}-standalone", base),
         };
         let output_exe = self.output_dir.join(&exe_name);
-        let main_bin = self.main_exe_name.as_deref().unwrap_or("app.exe");
 
-        single_file::build_standalone_exe(&self.staging_dir, &output_exe, main_bin)?;
+        match self.target {
+            TargetPlatform::Windows => {
+                let main_bin = self.main_exe_name.as_deref().unwrap_or("app.exe");
+                single_file::build_standalone_exe(&self.staging_dir, &output_exe, main_bin)?;
+            }
+            TargetPlatform::Linux => {
+                let main_bin = self.main_exe_name.as_deref().unwrap_or("app");
+                single_file::build_linux_standalone_exe(&self.staging_dir, &output_exe, main_bin)?;
+            }
+        }
         Ok(output_exe)
     }
 
@@ -128,4 +140,4 @@ impl<'a> StagingBuilder<'a> {
         }
         Ok(())
     }
-}
+}

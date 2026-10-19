@@ -19,6 +19,17 @@ pub fn calculate_crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// FNV-1a 64-bit. Unlike `DefaultHasher`, the output is identical across Rust versions,
+/// so stubs built by different `ship` builds agree on the cache key for the same payload.
+pub fn stable_hash(data: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}", hash)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEntry {
     pub path: String,
@@ -221,4 +232,11 @@ mod tests {
         let extracted = reader.extract_file(&reader.entries[0]).expect("extract failed");
         assert_eq!(extracted, b"Hello from LZ4! Repeated pattern Repeated pattern");
     }
-}
+
+    #[test]
+    fn test_stable_hash_is_fixed() {
+        // Known FNV-1a 64 vectors; these must never change or cached extractions break.
+        assert_eq!(stable_hash(b""), "cbf29ce484222325");
+        assert_eq!(stable_hash(b"a"), "af63dc4c8601ec8c");
+    }
+}

@@ -2,13 +2,12 @@ use anyhow::{anyhow, Context, Result};
 use colored::*;
 use std::env;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-use super::archive::ArchiveBuilder;
+use super::archive::{stable_hash, ArchiveBuilder};
 
 enum IconCandidate {
     Ico(PathBuf),
@@ -105,7 +104,7 @@ fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
     }
 
     if let Ok(cur) = env::current_dir() {
-        for name in &["wisdomParkicon.ico", "app.ico", "icon.ico"] {
+        for name in &["app.ico", "icon.ico"] {
             let p = cur.join(name);
             if p.is_file() {
                 return Some(IconCandidate::Ico(p));
@@ -243,9 +242,7 @@ pub fn build_linux_standalone_exe(
 
     let archive_bytes = archive_builder.build()?;
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    archive_bytes.hash(&mut hasher);
-    let build_hash = format!("{:016x}", hasher.finish());
+    let build_hash = stable_hash(&archive_bytes);
 
     let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_linux_build");
     fs::create_dir_all(&temp_build)?;
@@ -260,7 +257,8 @@ pub fn build_linux_standalone_exe(
          .global ship_payload_end\n\
          ship_payload_start:\n\
              .incbin \"{}\"\n\
-         ship_payload_end:\n",
+         ship_payload_end:\n\
+         .section .note.GNU-stack,\"\",@progbits\n",
         archive_bin_path.display()
     );
     fs::write(&asm_file, asm_content)?;
@@ -313,7 +311,7 @@ int main(int argc, char **argv) {{
     }}
 
     char app_dir[1024];
-    snprintf(app_dir, sizeof(app_dir), "%s/ShipApp_%s", tmp_root, "{main_exe_name}");
+    snprintf(app_dir, sizeof(app_dir), "%s/ShipApp_%s_%s", tmp_root, "{main_exe_name}", SHIP_BUILD_HASH);
     mkdir(app_dir, 0755);
 
     char hash_path[1024];
@@ -442,6 +440,12 @@ int main(int argc, char **argv) {{
     }}
     setenv("LD_LIBRARY_PATH", ld_env, 1);
 
+    // Match the Windows stub: run from the extraction dir so relative asset paths resolve.
+    if (chdir(app_dir) != 0) {{
+        perror("chdir failed");
+        return 1;
+    }}
+
     argv[0] = exe_path;
     execv(exe_path, argv);
 
@@ -510,9 +514,7 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
 
     let archive_bytes = archive_builder.build()?;
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    archive_bytes.hash(&mut hasher);
-    let build_hash = format!("{:016x}", hasher.finish());
+    let build_hash = stable_hash(&archive_bytes);
 
     let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build");
     fs::create_dir_all(&temp_build)?;
@@ -591,7 +593,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     GetTempPathA(MAX_PATH, temp);
 
     char app_dir[MAX_PATH];
-    snprintf(app_dir, MAX_PATH, "%sShipApp_%s", temp, "{main_exe_name}");
+    snprintf(app_dir, MAX_PATH, "%sShipApp_%s_%s", temp, "{main_exe_name}", SHIP_BUILD_HASH);
     CreateDirectoryA(app_dir, NULL);
 
     char hash_path[MAX_PATH];
@@ -869,4 +871,4 @@ END
     }
 
     Ok(())
-}
+}

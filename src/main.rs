@@ -119,7 +119,7 @@ fn main() -> Result<()> {
     let fallback_label = format!("{}-{:?}", app_name, target_platform).to_lowercase();
     let zip_label = args.name.as_deref().unwrap_or(&fallback_label);
 
-    let mut staging = StagingBuilder::new(&args.output, &app_name)?;
+    let mut staging = StagingBuilder::new(&args.output, &app_name, target_platform)?;
     staging.copy_binary(&binary_path)?;
     staging.copy_libraries(&libraries_list)?;
     staging.copy_assets(asset_collector.directories())?;
