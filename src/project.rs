@@ -48,6 +48,16 @@ pub struct ProjectConfig {
     pub itch: Option<ItchConfig>,
     /// `[sign]`: Authenticode-sign Windows executables with osslsigncode.
     pub sign: Option<SignConfig>,
+    /// `[appimage]`: AppImage-specific options.
+    pub appimage: AppImageConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppImageConfig {
+    /// Run from a writable copy in ~/.local/share/ship/<app> instead of the read-only image,
+    /// for apps that write saves or settings next to themselves.
+    pub writable: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -166,6 +176,9 @@ pub const TEMPLATE: &str = r#"# ship.toml - every setting is optional; command-l
 # [itch]
 # target = "you/your-game"
 # channel = "windows"      # default: the target platform
+
+# [appimage]
+# writable = false   # true: run from a writable copy in ~/.local/share (apps that save next to themselves)
 
 # Authenticode-sign Windows executables (needs osslsigncode)
 # [sign]

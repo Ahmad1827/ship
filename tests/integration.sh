@@ -101,6 +101,39 @@ else
     echo "appimage: skipped (squashfs-tools not installed)"
 fi
 
+echo "save files survive updates"
+SAVE="$WORK/saver"
+mkdir -p "$SAVE/assets"
+echo v1 > "$SAVE/assets/version.txt"
+cat > "$SAVE/main.cpp" <<'EOF'
+#include <cstdio>
+#include <fstream>
+#include <string>
+int main() {
+    int n = 0; { std::ifstream in("save.txt"); in >> n; }
+    { std::ofstream out("save.txt"); out << n + 1; }
+    std::ifstream v("assets/version.txt"); std::string ver; v >> ver;
+    std::printf("version=%s launches=%d\n", ver.c_str(), n + 1);
+    return 0;
+}
+EOF
+printf 'name = "Saver"\ntarget = "linux"\n[appimage]\nwritable = true\n' > "$SAVE/ship.toml"
+(cd "$SAVE" && "$SHIP" -s >/dev/null && ./dist/Saver-standalone >/dev/null && ./dist/Saver-standalone >/dev/null)
+echo v2 > "$SAVE/assets/version.txt"
+(cd "$SAVE" && "$SHIP" -s >/dev/null)
+out="$("$SAVE/dist/Saver-standalone")"
+check "standalone keeps saves across an update" contains "$out" "version=v2 launches=3"
+if command -v mksquashfs >/dev/null; then
+    export XDG_DATA_HOME="$WORK/data"
+    run_appimage() { "$SAVE/dist/Saver-x86_64.AppImage" --appimage-extract-and-run; }
+    echo v1 > "$SAVE/assets/version.txt"
+    (cd "$SAVE" && "$SHIP" --appimage >/dev/null)
+    run_appimage >/dev/null; run_appimage >/dev/null
+    echo v2 > "$SAVE/assets/version.txt"
+    (cd "$SAVE" && "$SHIP" --appimage >/dev/null)
+    check "writable AppImage keeps saves across an update" contains "$(run_appimage)" "version=v2 launches=3"
+fi
+
 echo "dry run / strict"
 mkdir -p "$WORK/gone/lib"
 echo 'int f(void){return 0;}' > "$WORK/gone/f.c"
@@ -154,6 +187,8 @@ EOF
         cp "$WIN/ship.toml" "$WIN/ship.toml.unsigned"
         printf '\n[sign]\npkcs12 = "%s"\ntimestamp_url = ""\n' "$WORK/sign.pfx" >> "$WIN/ship.toml"
         check "fails fast without password" bash -c "! (cd '$WIN' && '$SHIP' -t windows -s >/dev/null 2>&1)"
+        check "wrong password fails"        bash -c "! (cd '$WIN' && SHIP_SIGN_PASSWORD=wrong '$SHIP' -t windows -s >/dev/null 2>&1)"
+        check "failed build leaves no staging dir" bash -c "! ls '$WIN/dist' | grep -q _staging"
         (cd "$WIN" && SHIP_SIGN_PASSWORD=ci-pass "$SHIP" -t windows --all >/dev/null)
         verify() { osslsigncode verify -in "$1" -CAfile "$WORK/cert.pem" >/dev/null 2>&1; }
         check "standalone launcher signed"  verify "$WIN/dist/WinApp-standalone.exe"

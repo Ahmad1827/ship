@@ -83,7 +83,58 @@ static int is_build_hash(const char* s) {
 
 /* Deletes extractions left by older builds of this app (<prefix><other hash>). Files of a
    still-running old instance are locked and simply stay until the next launch. */
-static void remove_stale_extractions(const char* temp, const char* prefix) {
+/* True if `rel` (package-relative, '/' separated) is a file shipped in the payload. */
+static int in_payload(const char* rel) {
+    const unsigned char* cur = ship_payload_start + 12;
+    unsigned int file_count = 0;
+    memcpy(&file_count, ship_payload_start + 8, 4);
+    size_t rel_len = strlen(rel);
+    for (unsigned int i = 0; i < file_count; i++) {
+        unsigned short path_len = 0;
+        memcpy(&path_len, cur, 2);
+        if (path_len == rel_len && _strnicmp((const char*)cur + 2, rel, rel_len) == 0) return 1;
+        cur += 2 + path_len + 8 + 8 + 8 + 4;
+    }
+    return 0;
+}
+
+/* Moves files the app created itself (saves, settings, logs: anything not in the payload)
+   from an old extraction `dir` into `app_dir`, so updating the app never loses them.
+   `rel` is the path of `dir` inside the package ("" for the root). */
+static void migrate_user_files(const char* dir, const char* rel, const char* app_dir) {
+    char pattern[MAX_PATH];
+    snprintf(pattern, MAX_PATH, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+
+        char src[MAX_PATH], child_rel[MAX_PATH];
+        snprintf(src, MAX_PATH, "%s\\%s", dir, fd.cFileName);
+        snprintf(child_rel, MAX_PATH, "%s%s%s", rel, *rel ? "/" : "", fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            migrate_user_files(src, child_rel, app_dir);
+            continue;
+        }
+        if (!strcmp(child_rel, ".ship_hash") || in_payload(child_rel)) continue;
+
+        char dest[MAX_PATH];
+        snprintf(dest, MAX_PATH, "%s/%s", app_dir, child_rel);
+        WIN32_FILE_ATTRIBUTE_DATA existing;
+        if (GetFileAttributesExA(dest, GetFileExInfoStandard, &existing)
+            && CompareFileTime(&existing.ftLastWriteTime, &fd.ftLastWriteTime) >= 0) {
+            continue; /* already carried over from a newer old extraction */
+        }
+        create_parent_dirs(dest);
+        MoveFileExA(src, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void remove_stale_extractions(const char* temp, const char* prefix, const char* app_dir) {
     char pattern[MAX_PATH];
     snprintf(pattern, MAX_PATH, "%s%s*", temp, prefix);
     size_t plen = strlen(prefix);
@@ -97,6 +148,7 @@ static void remove_stale_extractions(const char* temp, const char* prefix) {
             && is_build_hash(hash) && strcmp(hash, SHIP_BUILD_HASH) != 0) {
             char stale[MAX_PATH];
             snprintf(stale, MAX_PATH, "%s%s", temp, fd.cFileName);
+            migrate_user_files(stale, "", app_dir);
             delete_tree(stale);
         }
     } while (FindNextFileA(h, &fd));
@@ -249,7 +301,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
             fclose(out_hf);
         }
         log_debug("Extraction complete.");
-        remove_stale_extractions(temp, dir_prefix);
+        remove_stale_extractions(temp, dir_prefix, app_dir);
     }
 
     /* Forward the stub's own arguments; lpCmdLine excludes the program name. */

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
 
-use super::archive::calculate_crc32;
+use super::archive::{calculate_crc32, StableHasher};
 use super::single_file::{find_icon_candidate, IconCandidate};
 use crate::project::ProjectConfig;
 use crate::sdk;
@@ -59,7 +59,12 @@ pub fn build_appimage(
     let id = desktop_id(&display_name);
 
     let app_run = app_dir.join("AppRun");
-    fs::write(&app_run, app_run_script(main_exe_name))?;
+    let script = if project.appimage.writable {
+        writable_app_run_script(main_exe_name, &id, &hash_dir(&payload_dir)?)
+    } else {
+        app_run_script(main_exe_name)
+    };
+    fs::write(&app_run, script)?;
     set_executable(&app_run)?;
 
     fs::write(app_dir.join(format!("{}.desktop", id)), desktop_entry(&display_name, &id, main_exe_name, project, console))?;
@@ -99,6 +104,47 @@ exec ./{} "$@"
 "#,
         shell_quote(exe_name)
     )
+}
+
+/// Copies the app into a per-user data dir the first time and after every update, then runs
+/// it from there. Files the app creates itself survive updates; shipped files are refreshed.
+fn writable_app_run_script(exe_name: &str, id: &str, build_hash: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+DATA="${{XDG_DATA_HOME:-$HOME/.local/share}}/ship/{id}"
+if [ "$(cat "$DATA/.ship_build" 2>/dev/null)" != "{hash}" ]; then
+    mkdir -p "$DATA" || exit 1
+    cp -rf "$HERE/app/." "$DATA/" || exit 1
+    chmod -R u+w "$DATA"
+    echo "{hash}" > "$DATA/.ship_build"
+fi
+export LD_LIBRARY_PATH="$DATA${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+cd "$DATA" || exit 1
+exec ./{exe} "$@"
+"#,
+        id = id,
+        hash = build_hash,
+        exe = shell_quote(exe_name)
+    )
+}
+
+/// Content hash of a directory tree (paths and bytes), used to detect app updates.
+fn hash_dir(dir: &Path) -> Result<String> {
+    let mut files: Vec<_> = WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+    files.sort();
+    let mut hasher = StableHasher::new();
+    for file in files {
+        hasher.update(file.strip_prefix(dir)?.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&fs::read(&file)?);
+    }
+    Ok(hasher.finish())
 }
 
 fn shell_quote(value: &str) -> String {

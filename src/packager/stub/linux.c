@@ -75,8 +75,47 @@ static int is_build_hash(const char *s) {
     return 1;
 }
 
-/* Deletes extractions left by older builds of this app (<prefix><other hash>). */
-static void remove_stale_extractions(const char *base, const char *prefix) {
+/* True if `rel` (package-relative, '/' separated) is a file shipped in the payload. */
+static int in_payload(const char *rel) {
+    const unsigned char *cur = ship_payload_start + 12;
+    unsigned int file_count = 0;
+    memcpy(&file_count, ship_payload_start + 8, 4);
+    size_t rel_len = strlen(rel);
+    for (unsigned int i = 0; i < file_count; i++) {
+        unsigned short path_len = 0;
+        memcpy(&path_len, cur, 2);
+        if (path_len == rel_len && memcmp(cur + 2, rel, rel_len) == 0) return 1;
+        cur += 2 + path_len + 8 + 8 + 8 + 4;
+    }
+    return 0;
+}
+
+/* nftw has no user pointer, so the migration source/destination live here. */
+static size_t migrate_root_len;
+static const char *migrate_dest_dir;
+
+/* Moves files the app created itself (saves, settings, logs: anything not in the payload)
+   from an old extraction into the new one, so updating the app never loses them. */
+static int migrate_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {
+    (void)ftw;
+    if (flag != FTW_F && flag != FTW_SL) return 0;
+    const char *rel = path + migrate_root_len + 1;
+    if (strcmp(rel, ".ship_hash") == 0 || in_payload(rel)) return 0;
+
+    char dest[1024];
+    snprintf(dest, sizeof(dest), "%s/%s", migrate_dest_dir, rel);
+    struct stat existing;
+    if (lstat(dest, &existing) == 0 && existing.st_mtime >= sb->st_mtime) {
+        return 0; /* already carried over from a newer old extraction */
+    }
+    create_parent_dirs(dest);
+    rename(path, dest);
+    return 0;
+}
+
+/* Deletes extractions left by older builds of this app (<prefix><other hash>),
+   after carrying the app's own files over into `app_dir`. */
+static void remove_stale_extractions(const char *base, const char *prefix, const char *app_dir) {
     DIR *d = opendir(base);
     if (!d) return;
     size_t plen = strlen(prefix);
@@ -86,6 +125,9 @@ static void remove_stale_extractions(const char *base, const char *prefix) {
         if (strncmp(e->d_name, prefix, plen) == 0 && is_build_hash(hash) && strcmp(hash, SHIP_BUILD_HASH) != 0) {
             char stale[1024];
             snprintf(stale, sizeof(stale), "%s/%s", base, e->d_name);
+            migrate_root_len = strlen(stale);
+            migrate_dest_dir = app_dir;
+            nftw(stale, migrate_entry, 16, FTW_PHYS);
             nftw(stale, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
         }
     }
@@ -218,7 +260,7 @@ int main(int argc, char **argv) {
             fputs(SHIP_BUILD_HASH, out_hf);
             fclose(out_hf);
         }
-        remove_stale_extractions(base_dir, dir_prefix);
+        remove_stale_extractions(base_dir, dir_prefix, app_dir);
     }
 
     char ld_env[2048];

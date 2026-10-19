@@ -24,6 +24,13 @@ pub struct StagingBuilder<'a> {
     target: TargetPlatform,
 }
 
+/// The staging dir is scratch space: remove it on every exit path, including errors.
+impl Drop for StagingBuilder<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.staging_dir);
+    }
+}
+
 impl<'a> StagingBuilder<'a> {
     pub fn new(output_dir: &'a Path, app_name: &str, target: TargetPlatform) -> Result<Self> {
         fs::create_dir_all(output_dir)?;

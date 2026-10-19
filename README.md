@@ -69,7 +69,7 @@ Generates a portable `.zip` in `dist/` containing the compiled binary, all resol
 ```bash
 ship -s
 ```
-Generates a single self-contained `.exe` in `dist/` that runs directly without requiring archive extraction.
+Generates a single self-contained `.exe` in `dist/` that runs directly without requiring archive extraction. Files the app writes next to itself (saves, settings) are carried over when a new version is launched.
 
 ### 3. Generate Both ZIP and Standalone Executable
 ```bash
@@ -91,7 +91,11 @@ ship ./path/to/game.exe
 ship -t linux --appimage          # zip + .AppImage
 ship -t linux --appimage -s       # standalone + .AppImage
 ```
-Builds a `.AppImage` from the pinned official AppImage runtime (downloaded once, SHA-256 verified) and `mksquashfs`. The app runs with its bundled libraries and its own folder as working directory, like the standalone launcher.
+Builds a `.AppImage` from the pinned official AppImage runtime (downloaded once, SHA-256 verified) and `mksquashfs`. The app runs with its bundled libraries and its own folder as working directory, like the standalone launcher. That folder is read-only inside an AppImage; if your app writes saves or settings next to itself, set this in `ship.toml` so it runs from a writable copy in `~/.local/share/ship/<name>` (kept across updates):
+```toml
+[appimage]
+writable = true
+```
 
 ### 7. Upload to itch.io
 ```bash

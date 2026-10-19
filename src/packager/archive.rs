@@ -22,12 +22,29 @@ pub fn calculate_crc32(data: &[u8]) -> u32 {
 /// FNV-1a 64-bit. Unlike `DefaultHasher`, the output is identical across Rust versions,
 /// so stubs built by different `ship` builds agree on the cache key for the same payload.
 pub fn stable_hash(data: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut hasher = StableHasher::new();
+    hasher.update(data);
+    hasher.finish()
+}
+
+/// Streaming form of [`stable_hash`], for hashing many files without loading them together.
+pub struct StableHasher(u64);
+
+impl StableHasher {
+    pub fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
     }
-    format!("{:016x}", hash)
+
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.0 ^= byte as u64;
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    pub fn finish(&self) -> String {
+        format!("{:016x}", self.0)
+    }
 }
 
 // Rust-side reader mirroring the C stub's decoder; exercised by the tests.
