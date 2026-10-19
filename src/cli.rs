@@ -23,6 +23,9 @@ pub struct Cli {
     #[arg(long, help = "Generate both .zip and single standalone .exe")]
     pub all: bool,
 
+    #[arg(long, help = "Also build a Linux .AppImage (needs mksquashfs)")]
+    pub appimage: bool,
+
     #[arg(long, help = "Additional library search paths")]
     pub search_paths: Vec<PathBuf>,
 

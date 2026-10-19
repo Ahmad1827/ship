@@ -36,6 +36,8 @@ pub struct ProjectConfig {
     pub console: bool,
     /// Add fallback fonts where the app is missing one.
     pub fonts: Option<bool>,
+    /// AppImage menu categories (freedesktop list), e.g. "Game;ActionGame;". Default "Game;".
+    pub categories: Option<String>,
 
     /// Raw C/C++ builds only: libraries to link, e.g. ["z", "sfml-graphics"].
     pub link: Vec<String>,
@@ -113,6 +115,7 @@ pub const TEMPLATE: &str = r#"# ship.toml - every setting is optional; command-l
 
 # console = false    # true for terminal apps (keeps stdout/stdin on Windows)
 # fonts = true       # add a fallback font where the app is missing one
+# categories = "Game;"   # AppImage menu categories
 
 # Raw C/C++ projects only (ignored for Cargo/CMake/Make):
 # link = ["z", "sfml-graphics", "sfml-window", "sfml-system"]

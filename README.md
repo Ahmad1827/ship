@@ -25,7 +25,8 @@ When developing games or native applications in C++, Rust, SFML, SDL2, or Raylib
 * **Autonomous Windows Cross-Compilation**: Cross-compiles for Windows directly from Linux/WSL using MinGW toolchains.
 * **Recursive Dependency Harvester**: Parses PE (`.exe`) and ELF import tables using `goblin` to detect and collect all third-party and toolchain DLLs.
 * **Smart Asset & Font Sniffer**: Automatically discovers resource folders (`assets/`, `Resources/`, `sprites/`, `data/`) and validates static TrueType font dependencies.
-* **Automated SDK Fetcher**: Downloads and caches required external Windows SDKs (such as SFML MinGW) directly in `~/.ship/`.
+* **Automated SDK Fetcher**: Downloads and caches required external Windows SDKs (such as SFML MinGW) directly in `~/.ship/`, verified against pinned SHA-256 checksums.
+* **AppImage Output (`--appimage`)**: Packages Linux builds as a single `.AppImage` with desktop entry and icon.
 * **Single-File Standalone Mode (`-s`)**: Embeds the app, its libraries and assets into one executable (Windows `.exe` or Linux binary). On first launch it extracts to a per-user cache and reuses it on later launches until the app changes.
 * **Project Config (`ship.toml`)**: Optional per-project settings for name, version info, icon, extra assets, excludes, link libraries and console mode.
 * **Dry Run & Strict Mode**: Preview exactly what would be packaged, or fail the build when a library is missing.
@@ -39,7 +40,7 @@ When developing games or native applications in C++, Rust, SFML, SDL2, or Raylib
 
 ```bash
 sudo apt update
-sudo apt install -y mingw-w64 curl build-essential fonts-dejavu-core
+sudo apt install -y mingw-w64 curl build-essential fonts-dejavu-core squashfs-tools
 rustup target add x86_64-pc-windows-gnu
 ```
 
@@ -84,7 +85,14 @@ ship -t linux
 ship ./path/to/game.exe
 ```
 
-### 6. Preview Without Packaging
+### 6. Linux AppImage
+```bash
+ship -t linux --appimage          # zip + .AppImage
+ship -t linux --appimage -s       # standalone + .AppImage
+```
+Builds a `.AppImage` from the pinned official AppImage runtime (downloaded once, SHA-256 verified) and `mksquashfs`. The app runs with its bundled libraries and its own folder as working directory, like the standalone launcher.
+
+### 7. Preview Without Packaging
 ```bash
 ship --dry-run            # lists libraries (found / missing / OS-provided), assets and fonts
 ship --dry-run --strict   # same, but exits with an error if a library is missing (handy in CI)
@@ -126,6 +134,7 @@ cflags = ["-std=c++20", "-Iinclude"]
 | `--target` | `-t` | Target platform (`windows` or `linux`) | `windows` |
 | `--single` | `-s` | Bundle into a single standalone executable | `false` |
 | `--all` | | Generate both `.zip` and standalone executable | `false` |
+| `--appimage` | | Also build a Linux `.AppImage` (needs `mksquashfs`) | `false` |
 | `--output` | `-o` | Output directory | `dist` |
 | `--name` | `-n` | Custom output base name | Project Name |
 | `--extra-assets` | `-a` | Explicit additional asset folders or files | None |

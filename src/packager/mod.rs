@@ -1,6 +1,7 @@
 pub mod single_file;
 pub mod zip;
 pub mod archive;
+pub mod appimage;
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -157,6 +158,17 @@ impl<'a> StagingBuilder<'a> {
             }
         }
         Ok(output_exe)
+    }
+
+    pub fn bundle_appimage(&self, custom_name: Option<&str>, opts: &StubOptions) -> Result<PathBuf> {
+        if self.target != TargetPlatform::Linux {
+            anyhow::bail!("AppImage is a Linux format; use --target linux");
+        }
+        let base = custom_name.unwrap_or(&self.app_name);
+        let output = self.output_dir.join(format!("{}-x86_64.AppImage", base));
+        let main_bin = self.main_exe_name.as_deref().unwrap_or("app");
+        appimage::build_appimage(&self.staging_dir, &output, main_bin, opts.project, opts.console)?;
+        Ok(output)
     }
 
     pub fn cleanup(&self) -> Result<()> {

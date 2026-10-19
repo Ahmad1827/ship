@@ -21,7 +21,7 @@ fn rc_escape(value: &str) -> String {
     value.replace('"', "\"\"")
 }
 
-enum IconCandidate {
+pub(super) enum IconCandidate {
     Ico(PathBuf),
     Png(PathBuf),
 }
@@ -104,7 +104,7 @@ fn generate_default_ico(ico_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
+pub(super) fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
     for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             if let Some(ext) = entry.path().extension().and_then(|s| s.to_str()) {

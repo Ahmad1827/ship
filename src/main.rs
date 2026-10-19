@@ -59,6 +59,9 @@ fn main() -> Result<()> {
         "linux" | "lin" => TargetPlatform::Linux,
         other => anyhow::bail!("Unsupported target: {}. Use 'windows' or 'linux'", other),
     };
+    if args.appimage && target_platform != TargetPlatform::Linux {
+        anyhow::bail!("--appimage needs --target linux (or target = \"linux\" in {})", project::CONFIG_FILE);
+    }
 
     let (binary_path, app_name) = match args.binary {
         Some(path) => {
@@ -193,23 +196,28 @@ fn main() -> Result<()> {
         staging.enforce_fonts(&referenced_fonts, common_font_locations)?;
     }
 
-    if args.single {
-        println!("{} Creating standalone single executable...", "⚡".bright_yellow());
-        let exe_path = staging.bundle_single_file(Some(zip_label), &stub_options)?;
-        staging.cleanup()?;
-        println!("\n{} Standalone executable ready: {}", "SUCCESS!".bold().green(), exe_path.display().to_string().bright_green());
-    } else if args.all {
+    // --appimage adds to the default zip unless -s/--all picked other formats.
+    let want_zip = args.all || (!args.single && !args.appimage);
+    let want_standalone = args.single || args.all;
+    let mut outputs: Vec<(&str, PathBuf)> = Vec::new();
+
+    if want_zip {
         println!("{} Creating .zip archive...", "⚡".bright_yellow());
-        let zip_path = staging.bundle_zip(Some(zip_label))?;
+        outputs.push(("ZIP package", staging.bundle_zip(Some(zip_label))?));
+    }
+    if want_standalone {
         println!("{} Creating standalone single executable...", "⚡".bright_yellow());
-        let exe_path = staging.bundle_single_file(Some(zip_label), &stub_options)?;
-        staging.cleanup()?;
-        println!("\n{} ZIP package: {}", "SUCCESS!".bold().green(), zip_path.display().to_string().bright_green());
-        println!("{} Standalone EXE: {}", "SUCCESS!".bold().green(), exe_path.display().to_string().bright_green());
-    } else {
-        let zip_path = staging.bundle_zip(Some(zip_label))?;
-        staging.cleanup()?;
-        println!("\n{} ZIP package ready: {}", "SUCCESS!".bold().green(), zip_path.display().to_string().bright_green());
+        outputs.push(("Standalone executable", staging.bundle_single_file(Some(zip_label), &stub_options)?));
+    }
+    if args.appimage {
+        println!("{} Creating AppImage...", "⚡".bright_yellow());
+        outputs.push(("AppImage", staging.bundle_appimage(Some(zip_label), &stub_options)?));
+    }
+    staging.cleanup()?;
+
+    println!();
+    for (label, path) in outputs {
+        println!("{} {}: {}", "SUCCESS!".bold().green(), label, path.display().to_string().bright_green());
     }
 
     Ok(())

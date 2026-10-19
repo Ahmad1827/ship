@@ -80,6 +80,27 @@ echo "level two" > "$APP/assets/levels/1.txt"
 (cd "$APP" && "$SHIP" -s >/dev/null && ./dist/ZApp-standalone >/dev/null)
 check "old extraction cleaned up"              test "$(ls "$XDG_CACHE_HOME/ship" | wc -l)" = 1
 
+if command -v mksquashfs >/dev/null; then
+    echo "appimage"
+    (cd "$APP" && "$SHIP" --appimage >/dev/null)
+    image="$APP/dist/ZApp-x86_64.AppImage"
+    check "AppImage is executable"           test -x "$image"
+    # CI runners may lack FUSE; the runtime can always run by extracting itself.
+    out="$(cd / && "$image" --appimage-extract-and-run "two words")"
+    check "AppImage runs and finds assets"   contains "$out" "level=[level two]"
+    check "AppImage forwards arguments"      contains "$out" "args=1 [two words]"
+    listing="$(cd "$WORK" && "$image" --appimage-extract >/dev/null && find squashfs-root -printf '%P\n')"
+    check "AppImage has desktop entry"       contains "$listing" "ZApp.desktop"
+    check "AppImage has icon"                contains "$listing" ".DirIcon"
+    check "AppImage bundles libz"            contains "$listing" "app/libz.so.1"
+    if command -v desktop-file-validate >/dev/null; then
+        check "desktop entry validates"      desktop-file-validate "$WORK/squashfs-root/ZApp.desktop"
+    fi
+    rm -rf "$WORK/squashfs-root"
+else
+    echo "appimage: skipped (squashfs-tools not installed)"
+fi
+
 echo "dry run / strict"
 mkdir -p "$WORK/gone/lib"
 echo 'int f(void){return 0;}' > "$WORK/gone/f.c"
