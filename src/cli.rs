@@ -41,6 +41,14 @@ pub struct Cli {
     #[arg(long, help = "Fail if any required library cannot be found")]
     pub strict: bool,
 
+    #[arg(
+        long,
+        num_args = 0..=1,
+        value_name = "USER/GAME[:CHANNEL]",
+        help = "Upload the result to itch.io with butler (target from [itch] in ship.toml if omitted)"
+    )]
+    pub push: Option<Option<String>>,
+
     #[arg(long, help = "Write a commented ship.toml template in the current directory")]
     pub init: bool,
 }

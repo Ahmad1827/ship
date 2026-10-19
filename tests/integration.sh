@@ -146,6 +146,40 @@ EOF
     strs="$(strings -el "$WIN/dist/WinApp-standalone.exe")"
     check "version info embedded"       contains "$strs" "2.3.1.0"
     check "product name from ship.toml" contains "$strs" "WinApp"
+    if command -v osslsigncode >/dev/null; then
+        echo "signing"
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -days 2 \
+            -subj "/CN=Ship CI Signer" -addext "extendedKeyUsage=codeSigning" 2>/dev/null
+        openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" -out "$WORK/sign.pfx" -passout pass:ci-pass
+        cp "$WIN/ship.toml" "$WIN/ship.toml.unsigned"
+        printf '\n[sign]\npkcs12 = "%s"\ntimestamp_url = ""\n' "$WORK/sign.pfx" >> "$WIN/ship.toml"
+        check "fails fast without password" bash -c "! (cd '$WIN' && '$SHIP' -t windows -s >/dev/null 2>&1)"
+        (cd "$WIN" && SHIP_SIGN_PASSWORD=ci-pass "$SHIP" -t windows --all >/dev/null)
+        verify() { osslsigncode verify -in "$1" -CAfile "$WORK/cert.pem" >/dev/null 2>&1; }
+        check "standalone launcher signed"  verify "$WIN/dist/WinApp-standalone.exe"
+        unzip -q -o "$WIN/dist/WinApp.zip" -d "$WORK/unzipped"
+        check "app inside zip signed"       verify "$WORK/unzipped/winapp.exe"
+        mv "$WIN/ship.toml.unsigned" "$WIN/ship.toml"
+        (cd "$WIN" && "$SHIP" -t windows --all >/dev/null)   # unsigned build for the Windows runner
+    else
+        echo "signing: skipped (osslsigncode not installed)"
+    fi
+
+    echo "push"
+    # Stand-in butler that records its arguments; the real one is never called.
+    mkdir -p "$WORK/fakebin"
+    printf '%s\n' '#!/bin/sh' \
+        '[ "$1" = "-V" ] && exit 0' \
+        "echo \"\$*\" >> '$WORK/butler.log'" \
+        "[ -d \"\$2\" ] && ls \"\$2\" >> '$WORK/butler.log'" \
+        'exit 0' > "$WORK/fakebin/butler"
+    chmod +x "$WORK/fakebin/butler"
+    (cd "$WIN" && PATH="$WORK/fakebin:$PATH" "$SHIP" -t windows --push me/winapp >/dev/null)
+    log="$(cat "$WORK/butler.log")"
+    check "pushes package folder to platform channel" contains "$log" "me/winapp:windows --userversion 2.3.1"
+    check "pushed folder contains the app"            contains "$log" "winapp.exe"
+    check "rejects a path as push target"             bash -c "! (cd '$WIN' && '$SHIP' --push ./winapp.exe >/dev/null 2>&1)"
+
     if [[ -n "${SHIP_OUT_DIR:-}" ]]; then
         mkdir -p "$SHIP_OUT_DIR"
         cp "$WIN/dist/WinApp-standalone.exe" "$SHIP_OUT_DIR/"

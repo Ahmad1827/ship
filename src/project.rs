@@ -43,6 +43,44 @@ pub struct ProjectConfig {
     pub link: Vec<String>,
     /// Raw C/C++ builds only: extra compiler flags, e.g. ["-std=c++20", "-Iinclude"].
     pub cflags: Vec<String>,
+
+    /// `[itch]`: where `--push` uploads with butler.
+    pub itch: Option<ItchConfig>,
+    /// `[sign]`: Authenticode-sign Windows executables with osslsigncode.
+    pub sign: Option<SignConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ItchConfig {
+    /// itch.io project, "user/game" (a ":channel" suffix is allowed too).
+    pub target: Option<String>,
+    /// butler channel; defaults to the target platform ("windows" / "linux").
+    pub channel: Option<String>,
+}
+
+pub const DEFAULT_SIGN_PASSWORD_ENV: &str = "SHIP_SIGN_PASSWORD";
+pub const DEFAULT_TIMESTAMP_URL: &str = "http://timestamp.digicert.com";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignConfig {
+    /// .pfx / .p12 certificate bundle.
+    pub pkcs12: PathBuf,
+    /// Environment variable holding the certificate password; never put it in the file.
+    #[serde(default = "default_password_env")]
+    pub password_env: String,
+    /// RFC 3161 timestamp server; "" disables timestamping.
+    #[serde(default = "default_timestamp_url")]
+    pub timestamp_url: String,
+}
+
+fn default_password_env() -> String {
+    DEFAULT_SIGN_PASSWORD_ENV.to_string()
+}
+
+fn default_timestamp_url() -> String {
+    DEFAULT_TIMESTAMP_URL.to_string()
 }
 
 impl ProjectConfig {
@@ -66,6 +104,9 @@ impl ProjectConfig {
         config.search_paths.iter_mut().for_each(resolve);
         config.icon.as_mut().map(resolve);
         config.output.as_mut().map(resolve);
+        if let Some(sign) = config.sign.as_mut() {
+            resolve(&mut sign.pkcs12);
+        }
         Ok(config)
     }
 
@@ -120,6 +161,17 @@ pub const TEMPLATE: &str = r#"# ship.toml - every setting is optional; command-l
 # Raw C/C++ projects only (ignored for Cargo/CMake/Make):
 # link = ["z", "sfml-graphics", "sfml-window", "sfml-system"]
 # cflags = ["-std=c++20", "-Iinclude"]
+
+# Upload with `ship --push` (needs butler, logged in via `butler login` or BUTLER_API_KEY)
+# [itch]
+# target = "you/your-game"
+# channel = "windows"      # default: the target platform
+
+# Authenticode-sign Windows executables (needs osslsigncode)
+# [sign]
+# pkcs12 = "certs/codesign.pfx"
+# password_env = "SHIP_SIGN_PASSWORD"   # env var holding the password
+# timestamp_url = "http://timestamp.digicert.com"
 "#;
 
 #[cfg(test)]
@@ -130,6 +182,18 @@ mod tests {
     fn template_parses() {
         let config: ProjectConfig = toml::from_str(TEMPLATE).expect("template must be valid TOML");
         assert!(config.name.is_none());
+    }
+
+    #[test]
+    fn parses_itch_and_sign_tables() {
+        let config: ProjectConfig = toml::from_str(
+            "[itch]\ntarget = \"me/game\"\n[sign]\npkcs12 = \"c.pfx\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.itch.unwrap().target.as_deref(), Some("me/game"));
+        let sign = config.sign.unwrap();
+        assert_eq!(sign.password_env, DEFAULT_SIGN_PASSWORD_ENV);
+        assert_eq!(sign.timestamp_url, DEFAULT_TIMESTAMP_URL);
     }
 
     #[test]

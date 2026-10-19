@@ -26,6 +26,7 @@ When developing games or native applications in C++, Rust, SFML, SDL2, or Raylib
 * **Recursive Dependency Harvester**: Parses PE (`.exe`) and ELF import tables using `goblin` to detect and collect all third-party and toolchain DLLs.
 * **Smart Asset & Font Sniffer**: Automatically discovers resource folders (`assets/`, `Resources/`, `sprites/`, `data/`) and validates static TrueType font dependencies.
 * **Automated SDK Fetcher**: Downloads and caches required external Windows SDKs (such as SFML MinGW) directly in `~/.ship/`, verified against pinned SHA-256 checksums.
+* **itch.io Upload & Code Signing**: `--push` uploads with butler; a `[sign]` table Authenticode-signs Windows executables.
 * **AppImage Output (`--appimage`)**: Packages Linux builds as a single `.AppImage` with desktop entry and icon.
 * **Single-File Standalone Mode (`-s`)**: Embeds the app, its libraries and assets into one executable (Windows `.exe` or Linux binary). On first launch it extracts to a per-user cache and reuses it on later launches until the app changes.
 * **Project Config (`ship.toml`)**: Optional per-project settings for name, version info, icon, extra assets, excludes, link libraries and console mode.
@@ -92,7 +93,27 @@ ship -t linux --appimage -s       # standalone + .AppImage
 ```
 Builds a `.AppImage` from the pinned official AppImage runtime (downloaded once, SHA-256 verified) and `mksquashfs`. The app runs with its bundled libraries and its own folder as working directory, like the standalone launcher.
 
-### 7. Preview Without Packaging
+### 7. Upload to itch.io
+```bash
+ship --push you/your-game            # channel defaults to the platform: you/your-game:windows
+ship -s --push you/your-game:demo    # explicit channel
+```
+Uses [butler](https://itch.io/docs/butler/) (log in once with `butler login`, or set `BUTLER_API_KEY` in CI). It pushes the package folder when a zip is built, which lets butler upload only what changed, or the single file when you only built a standalone executable or AppImage. `version` from `ship.toml` becomes the itch.io user version.
+
+### 8. Code Signing (Windows)
+Add a `[sign]` table to `ship.toml` and put the certificate password in an environment variable:
+```toml
+[sign]
+pkcs12 = "certs/codesign.pfx"
+password_env = "SHIP_SIGN_PASSWORD"            # default
+timestamp_url = "http://timestamp.digicert.com" # default; "" to skip
+```
+```bash
+SHIP_SIGN_PASSWORD=... ship -s
+```
+Your executable is signed before packaging, so the zip and the standalone payload carry the signed binary, and the standalone launcher is signed too. Third-party DLLs are left untouched. Needs `osslsigncode`.
+
+### 9. Preview Without Packaging
 ```bash
 ship --dry-run            # lists libraries (found / missing / OS-provided), assets and fonts
 ship --dry-run --strict   # same, but exits with an error if a library is missing (handy in CI)
@@ -142,6 +163,7 @@ cflags = ["-std=c++20", "-Iinclude"]
 | `--console` | | Build a console (terminal) app on Windows instead of a GUI app | `false` |
 | `--dry-run` | | Show what would be packaged without creating a package | `false` |
 | `--strict` | | Fail if any required library cannot be found | `false` |
+| `--push` | | Upload to itch.io with butler (`user/game[:channel]`, or `[itch]` in `ship.toml`) | |
 | `--init` | | Write a commented `ship.toml` template | |
 
 Set `SHIP_DEBUG=1` when running a Windows standalone executable to log launcher activity to `%TEMP%\ship_debug.log`.

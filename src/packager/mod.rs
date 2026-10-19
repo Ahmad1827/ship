@@ -2,6 +2,8 @@ pub mod single_file;
 pub mod zip;
 pub mod archive;
 pub mod appimage;
+pub mod itch;
+pub mod sign;
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -169,6 +171,16 @@ impl<'a> StagingBuilder<'a> {
         let main_bin = self.main_exe_name.as_deref().unwrap_or("app");
         appimage::build_appimage(&self.staging_dir, &output, main_bin, opts.project, opts.console)?;
         Ok(output)
+    }
+
+    /// Path of the app's own executable inside the staging dir.
+    pub fn main_binary(&self) -> Option<PathBuf> {
+        self.main_exe_name.as_ref().map(|name| self.staging_dir.join(name))
+    }
+
+    /// The package folder, i.e. what the zip contains.
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging_dir
     }
 
     pub fn cleanup(&self) -> Result<()> {

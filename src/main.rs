@@ -59,6 +59,25 @@ fn main() -> Result<()> {
         "linux" | "lin" => TargetPlatform::Linux,
         other => anyhow::bail!("Unsupported target: {}. Use 'windows' or 'linux'", other),
     };
+    // Check signing and upload prerequisites now rather than after a full build.
+    let sign_config = match (&project.sign, target_platform) {
+        (Some(sign), TargetPlatform::Windows) if !args.dry_run => {
+            packager::sign::preflight(sign)?;
+            Some(sign)
+        }
+        _ => None,
+    };
+    let push_target = match &args.push {
+        Some(cli_target) => {
+            let target = packager::itch::resolve_target(cli_target.as_deref(), project.itch.as_ref(), target_platform)?;
+            if !args.dry_run {
+                packager::itch::preflight()?;
+            }
+            Some(target)
+        }
+        None => None,
+    };
+
     if args.appimage && target_platform != TargetPlatform::Linux {
         anyhow::bail!("--appimage needs --target linux (or target = \"linux\" in {})", project::CONFIG_FILE);
     }
@@ -168,6 +187,12 @@ fn main() -> Result<()> {
 
     if args.dry_run {
         print_dry_run(&binary_path, &libraries_list, &os_libraries, &asset_collector, &referenced_fonts, common_font_locations, &project);
+        if let Some(target) = &push_target {
+            println!("{} {}", "Would push to:".bold(), target);
+        }
+        if project.sign.is_some() && target_platform == TargetPlatform::Windows {
+            println!("{} yes ({})", "Sign:".bold(), project.sign.as_ref().unwrap().pkcs12.display());
+        }
         if args.strict && !missing.is_empty() {
             anyhow::bail!("Missing libraries: {}", missing.join(", "));
         }
@@ -195,6 +220,10 @@ fn main() -> Result<()> {
     if font_mode != Some(false) {
         staging.enforce_fonts(&referenced_fonts, common_font_locations)?;
     }
+    if let (Some(sign), Some(main_binary)) = (sign_config, staging.main_binary()) {
+        // Before packaging, so the zip and the standalone payload carry the signed binary.
+        packager::sign::sign_file(sign, &main_binary, &app_name)?;
+    }
 
     // --appimage adds to the default zip unless -s/--all picked other formats.
     let want_zip = args.all || (!args.single && !args.appimage);
@@ -207,11 +236,26 @@ fn main() -> Result<()> {
     }
     if want_standalone {
         println!("{} Creating standalone single executable...", "⚡".bright_yellow());
-        outputs.push(("Standalone executable", staging.bundle_single_file(Some(zip_label), &stub_options)?));
+        let exe = staging.bundle_single_file(Some(zip_label), &stub_options)?;
+        if let Some(sign) = sign_config {
+            packager::sign::sign_file(sign, &exe, &app_name)?;
+        }
+        outputs.push(("Standalone executable", exe));
     }
     if args.appimage {
         println!("{} Creating AppImage...", "⚡".bright_yellow());
         outputs.push(("AppImage", staging.bundle_appimage(Some(zip_label), &stub_options)?));
+    }
+    if let Some(target) = &push_target {
+        // The package folder when there is a zip (butler diffs folders efficiently),
+        // otherwise the single file that was built.
+        let push_path = if want_zip {
+            staging.staging_dir().to_path_buf()
+        } else {
+            outputs[0].1.clone()
+        };
+        packager::itch::push(&push_path, target, project.version.as_deref())?;
+        outputs.push(("Pushed to itch.io", PathBuf::from(target)));
     }
     staging.cleanup()?;
 
