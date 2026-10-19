@@ -183,67 +183,53 @@ fn find_icon_candidate(staging_dir: &Path) -> Option<IconCandidate> {
     None
 }
 
-const DECOMPRESSOR_C_SOURCE: &str = r#"
-#include <stddef.h>
-#include <string.h>
+// Launcher sources, compiled per package with a generated ship_config.h.
+const STUB_LZ4_C: &str = include_str!("stub/lz4.c");
+const STUB_LINUX_C: &str = include_str!("stub/linux.c");
+const STUB_WINDOWS_C: &str = include_str!("stub/windows.c");
 
-int ship_lz4_decompress(const unsigned char *src, size_t src_len, unsigned char *dest, size_t dest_len) {
-    size_t src_pos = 0;
-    size_t dest_pos = 0;
+/// Scratch dir for one stub build; removed on drop so failed builds don't leave it behind.
+struct StubBuildDir(PathBuf);
 
-    while (src_pos < src_len && dest_pos < dest_len) {
-        unsigned char token = src[src_pos++];
-        size_t lit_len = token >> 4;
+impl Drop for StubBuildDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
-        if (lit_len == 15) {
-            unsigned char s = 0;
-            do {
-                if (src_pos >= src_len) return -1;
-                s = src[src_pos++];
-                lit_len += s;
-            } while (s == 255);
-        }
-
-        if (src_pos + lit_len > src_len || dest_pos + lit_len > dest_len) return -2;
-        memcpy(dest + dest_pos, src + src_pos, lit_len);
-        src_pos += lit_len;
-        dest_pos += lit_len;
-
-        if (dest_pos >= dest_len) break;
-        if (src_pos + 2 > src_len) return -3;
-
-        unsigned short offset = (unsigned short)(src[src_pos] | (src[src_pos + 1] << 8));
-        src_pos += 2;
-        if (offset == 0 || (size_t)offset > dest_pos) return -4;
-
-        size_t match_len = (token & 0x0F) + 4;
-        if (match_len == 19) {
-            unsigned char s = 0;
-            do {
-                if (src_pos >= src_len) return -5;
-                s = src[src_pos++];
-                match_len += s;
-            } while (s == 255);
-        }
-
-        if (dest_pos + match_len > dest_len) return -6;
-        for (size_t i = 0; i < match_len; i++) {
-            dest[dest_pos] = dest[dest_pos - offset];
-            dest_pos++;
+/// Escapes a value for a C string literal.
+fn c_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    // Octal escapes always stop after 3 digits, unlike \x.
+                    out.push_str(&format!("\\{:03o}", b));
+                }
+            }
         }
     }
-
-    return (dest_pos == dest_len) ? 0 : -7;
+    out.push('"');
+    out
 }
-"#;
 
-pub fn build_linux_standalone_exe(
+/// Packs the staging dir and writes everything the stub compiler needs into `build_dir`:
+/// the payload, an assembly file that embeds it, the C sources and ship_config.h.
+/// Returns the source files to compile.
+fn prepare_stub_sources(
     staging_dir: &Path,
-    output_exe: &Path,
-    main_exe_name: &str,
-) -> Result<()> {
+    build_dir: &Path,
+    exe_name: &str,
+    console: bool,
+    stub_source: &str,
+    rodata_section: &str,
+) -> Result<Vec<PathBuf>> {
     let mut archive_builder = ArchiveBuilder::new();
-
     for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let path = entry.path();
@@ -251,306 +237,75 @@ pub fn build_linux_standalone_exe(
             archive_builder.add_file(path, &rel)?;
         }
     }
-
     let archive_bytes = archive_builder.build()?;
-
     let build_hash = stable_hash(&archive_bytes);
 
-    let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_linux_build");
-    fs::create_dir_all(&temp_build)?;
+    fs::create_dir_all(build_dir)?;
+    let payload = build_dir.join("payload.bin");
+    fs::write(&payload, &archive_bytes)?;
 
-    let archive_bin_path = temp_build.join("payload.bin");
-    fs::write(&archive_bin_path, &archive_bytes)?;
-
-    let asm_file = temp_build.join("payload.s");
-    let asm_content = format!(
-        ".section .rodata\n\
-         .global ship_payload_start\n\
-         .global ship_payload_end\n\
-         ship_payload_start:\n\
-             .incbin \"{}\"\n\
-         ship_payload_end:\n\
-         .section .note.GNU-stack,\"\",@progbits\n",
-        archive_bin_path.display()
+    let mut asm = format!(
+        "{}\n.global ship_payload_start\n.global ship_payload_end\nship_payload_start:\n    .incbin {}\nship_payload_end:\n",
+        rodata_section,
+        c_string(&payload.to_string_lossy())
     );
-    fs::write(&asm_file, asm_content)?;
+    if rodata_section.contains("rodata") {
+        asm.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+    }
+    let asm_file = build_dir.join("payload.s");
+    fs::write(&asm_file, asm)?;
 
-    let lz4_file = temp_build.join("lz4_stub.c");
-    fs::write(&lz4_file, DECOMPRESSOR_C_SOURCE)?;
+    fs::write(
+        build_dir.join("ship_config.h"),
+        format!(
+            "#define SHIP_BUILD_HASH {}\n#define SHIP_EXE_NAME {}\n#define SHIP_CONSOLE {}\n",
+            c_string(&build_hash),
+            c_string(exe_name),
+            if console { 1 } else { 0 }
+        ),
+    )?;
 
-    let c_file = temp_build.join("stub.c");
-    let c_content = format!(
-        r#"#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <ctype.h>
-#include <dirent.h>
-#include <ftw.h>
+    let lz4_file = build_dir.join("lz4.c");
+    fs::write(&lz4_file, STUB_LZ4_C)?;
+    let stub_file = build_dir.join("stub.c");
+    fs::write(&stub_file, stub_source)?;
 
-#define SHIP_BUILD_HASH "{build_hash}"
+    Ok(vec![asm_file, stub_file, lz4_file])
+}
 
-extern const unsigned char ship_payload_start[];
-extern const unsigned char ship_payload_end[];
-extern int ship_lz4_decompress(const unsigned char *src, size_t src_len, unsigned char *dest, size_t dest_len);
+fn run_compiler(mut cmd: Command, what: &str) -> Result<()> {
+    let program = cmd.get_program().to_string_lossy().to_string();
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to invoke {} for {}", program, what))?;
+    if !status.success() {
+        return Err(anyhow!("{} failed to build {}", program, what));
+    }
+    Ok(())
+}
 
-static unsigned int calc_crc32(const unsigned char *data, size_t len) {{
-    unsigned int crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {{
-        crc ^= (unsigned int)data[i];
-        for (int j = 0; j < 8; j++) {{
-            unsigned int mask = -(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB88320U & mask);
-        }}
-    }}
-    return ~crc;
-}}
-
-static void create_parent_dirs(char* path) {{
-    for (char* p = path + 1; *p; p++) {{
-        if (*p == '/') {{
-            *p = '\0';
-            mkdir(path, 0755);
-            *p = '/';
-        }}
-    }}
-}}
-
-/* Per-user cache dir. Never a shared world-writable path: another user could pre-create
-   the extraction dir there with their own binary and a matching .ship_hash. */
-static int prepare_base_dir(char *out, size_t len) {{
-    const char *xdg = getenv("XDG_CACHE_HOME");
-    const char *home = getenv("HOME");
-    if (xdg && xdg[0] == '/') {{
-        mkdir(xdg, 0700);
-        snprintf(out, len, "%s/ship", xdg);
-    }} else if (home && home[0] == '/') {{
-        snprintf(out, len, "%s/.cache", home);
-        mkdir(out, 0700);
-        snprintf(out, len, "%s/.cache/ship", home);
-    }} else {{
-        const char *tmp = getenv("TMPDIR");
-        if (!tmp || !*tmp) tmp = "/tmp";
-        snprintf(out, len, "%s/ship-%u", tmp, (unsigned)getuid());
-    }}
-    mkdir(out, 0700);
-
-    struct stat st;
-    if (lstat(out, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 022)) {{
-        fprintf(stderr, "Error: refusing to use unsafe cache dir %s\n", out);
-        return -1;
-    }}
-    return 0;
-}}
-
-static int remove_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {{
-    (void)sb; (void)flag; (void)ftw;
-    return remove(path);
-}}
-
-static int is_build_hash(const char *s) {{
-    if (strlen(s) != 16) return 0;
-    for (; *s; s++) if (!isxdigit((unsigned char)*s)) return 0;
-    return 1;
-}}
-
-/* Deletes extractions left by older builds of this app (<prefix><other hash>). */
-static void remove_stale_extractions(const char *base, const char *prefix) {{
-    DIR *d = opendir(base);
-    if (!d) return;
-    size_t plen = strlen(prefix);
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {{
-        const char *hash = e->d_name + plen;
-        if (strncmp(e->d_name, prefix, plen) == 0 && is_build_hash(hash) && strcmp(hash, SHIP_BUILD_HASH) != 0) {{
-            char stale[1024];
-            snprintf(stale, sizeof(stale), "%s/%s", base, e->d_name);
-            nftw(stale, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
-        }}
-    }}
-    closedir(d);
-}}
-
-int main(int argc, char **argv) {{
-    char base_dir[1024];
-    if (prepare_base_dir(base_dir, sizeof(base_dir)) != 0) {{
-        return 1;
-    }}
-
-    const char *dir_prefix = "{main_exe_name}_";
-    char app_dir[1024];
-    snprintf(app_dir, sizeof(app_dir), "%s/%s%s", base_dir, dir_prefix, SHIP_BUILD_HASH);
-    mkdir(app_dir, 0755);
-
-    char hash_path[1024];
-    snprintf(hash_path, sizeof(hash_path), "%s/.ship_hash", app_dir);
-
-    char exe_path[1024];
-    snprintf(exe_path, sizeof(exe_path), "%s/%s", app_dir, "{main_exe_name}");
-
-    int need_extract = 1;
-    FILE* hf = fopen(hash_path, "r");
-    if (hf) {{
-        char stored_hash[64] = {{0}};
-        if (fgets(stored_hash, sizeof(stored_hash), hf)) {{
-            char* nl = strchr(stored_hash, '\n');
-            if (nl) *nl = '\0';
-            char* cr = strchr(stored_hash, '\r');
-            if (cr) *cr = '\0';
-            if (strcmp(stored_hash, SHIP_BUILD_HASH) == 0 && access(exe_path, X_OK) == 0) {{
-                need_extract = 0;
-            }}
-        }}
-        fclose(hf);
-    }}
-
-    if (need_extract) {{
-        const unsigned char* p = ship_payload_start;
-        const unsigned char* end_ptr = ship_payload_end;
-
-        if ((size_t)(end_ptr - p) < 12 || memcmp(p, "SHIP", 4) != 0) {{
-            fprintf(stderr, "Error: Corrupted archive header\n");
-            return 1;
-        }}
-
-        p += 8;
-        unsigned int file_count = 0;
-        memcpy(&file_count, p, 4);
-        p += 4;
-
-        const unsigned char* cur = p;
-        for (unsigned int i = 0; i < file_count; i++) {{
-            unsigned short plen = 0;
-            memcpy(&plen, cur, 2);
-            cur += 2 + plen + 8 + 8 + 8 + 4;
-        }}
-        const unsigned char* data_start = cur;
-
-        cur = p;
-        for (unsigned int i = 0; i < file_count; i++) {{
-            unsigned short path_len = 0;
-            memcpy(&path_len, cur, 2);
-            cur += 2;
-
-            char rel_path[1024] = {{0}};
-            if (path_len < sizeof(rel_path)) {{
-                memcpy(rel_path, cur, path_len);
-                rel_path[path_len] = '\0';
-            }}
-            cur += path_len;
-
-            unsigned long long uncomp_sz = 0;
-            memcpy(&uncomp_sz, cur, 8);
-            cur += 8;
-
-            unsigned long long comp_sz = 0;
-            memcpy(&comp_sz, cur, 8);
-            cur += 8;
-
-            unsigned long long offset = 0;
-            memcpy(&offset, cur, 8);
-            cur += 8;
-
-            unsigned int expected_crc = 0;
-            memcpy(&expected_crc, cur, 4);
-            cur += 4;
-
-            const unsigned char* comp_bytes = data_start + offset;
-            unsigned char* uncomp_bytes = (unsigned char*)malloc((size_t)uncomp_sz);
-            if (!uncomp_bytes && uncomp_sz > 0) {{
-                fprintf(stderr, "Error: Memory allocation failed\n");
-                return 2;
-            }}
-
-            if (uncomp_sz > 0) {{
-                int err = ship_lz4_decompress(comp_bytes, (size_t)comp_sz, uncomp_bytes, (size_t)uncomp_sz);
-                if (err != 0) {{
-                    fprintf(stderr, "Error: Failed decompressing %s\n", rel_path);
-                    free(uncomp_bytes);
-                    return 3;
-                }}
-                if (calc_crc32(uncomp_bytes, (size_t)uncomp_sz) != expected_crc) {{
-                    fprintf(stderr, "Error: Checksum mismatch for %s\n", rel_path);
-                    free(uncomp_bytes);
-                    return 4;
-                }}
-            }}
-
-            char out_path[1024];
-            snprintf(out_path, sizeof(out_path), "%s/%s", app_dir, rel_path);
-            create_parent_dirs(out_path);
-
-            FILE* out_f = fopen(out_path, "wb");
-            if (out_f) {{
-                if (uncomp_sz > 0) {{
-                    fwrite(uncomp_bytes, 1, (size_t)uncomp_sz, out_f);
-                }}
-                fclose(out_f);
-                chmod(out_path, 0755);
-            }}
-
-            if (uncomp_bytes) free(uncomp_bytes);
-        }}
-
-        FILE* out_hf = fopen(hash_path, "w");
-        if (out_hf) {{
-            fputs(SHIP_BUILD_HASH, out_hf);
-            fclose(out_hf);
-        }}
-        remove_stale_extractions(base_dir, dir_prefix);
-    }}
-
-    char ld_env[2048];
-    const char *orig_ld = getenv("LD_LIBRARY_PATH");
-    if (orig_ld && *orig_ld) {{
-        snprintf(ld_env, sizeof(ld_env), "%s:%s", app_dir, orig_ld);
-    }} else {{
-        snprintf(ld_env, sizeof(ld_env), "%s", app_dir);
-    }}
-    setenv("LD_LIBRARY_PATH", ld_env, 1);
-
-    // Match the Windows stub: run from the extraction dir so relative asset paths resolve.
-    if (chdir(app_dir) != 0) {{
-        perror("chdir failed");
-        return 1;
-    }}
-
-    argv[0] = exe_path;
-    execv(exe_path, argv);
-
-    perror("execv failed");
-    return 1;
-}}
-"#
-    );
-    fs::write(&c_file, c_content)?;
+pub fn build_linux_standalone_exe(
+    staging_dir: &Path,
+    output_exe: &Path,
+    main_exe_name: &str,
+) -> Result<()> {
+    let build_dir = StubBuildDir(staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_linux_build"));
+    let sources = prepare_stub_sources(staging_dir, &build_dir.0, main_exe_name, false, STUB_LINUX_C, ".section .rodata")?;
 
     if let Some(parent) = output_exe.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let status = Command::new("gcc")
-        .arg("-O2")
+    let mut cmd = Command::new("gcc");
+    cmd.arg("-O2")
         // Paths are bounded at 1 KB; gcc's "may be truncated" notes are just noise for users.
         .arg("-Wno-format-truncation")
-        .arg(&asm_file)
-        .arg(&c_file)
-        .arg(&lz4_file)
+        .arg("-I")
+        .arg(&build_dir.0)
+        .args(&sources)
         .arg("-o")
-        .arg(output_exe)
-        .status()
-        .context("Failed to invoke host gcc compiler for Linux standalone stub")?;
-
-    let _ = fs::remove_dir_all(&temp_build);
-
-    if !status.success() {
-        return Err(anyhow!("Failed to compile Linux standalone executable"));
-    }
-
-    Ok(())
+        .arg(output_exe);
+    run_compiler(cmd, "the Linux standalone launcher")
 }
 
 pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name: &str, opts: &StubOptions) -> Result<()> {
@@ -576,349 +331,16 @@ pub fn build_standalone_exe(staging_dir: &Path, output_exe: &Path, main_exe_name
         }
     }
 
-    let mut archive_builder = ArchiveBuilder::new();
-
-    for entry in WalkDir::new(staging_dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            let rel = path.strip_prefix(staging_dir)?.to_string_lossy().replace('\\', "/");
-            archive_builder.add_file(path, &rel)?;
-        }
-    }
-
-    let archive_bytes = archive_builder.build()?;
-
-    let build_hash = stable_hash(&archive_bytes);
-    let console = if opts.console { 1 } else { 0 };
-
-    let temp_build = staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build");
-    fs::create_dir_all(&temp_build)?;
-
-    let archive_bin_path = temp_build.join("payload.bin");
-    fs::write(&archive_bin_path, &archive_bytes)?;
-
-    let asm_file = temp_build.join("payload.s");
-    let asm_content = format!(
-        ".section .rdata,\"dr\"\n\
-         .global ship_payload_start\n\
-         .global ship_payload_end\n\
-         ship_payload_start:\n\
-             .incbin \"{}\"\n\
-         ship_payload_end:\n",
-        archive_bin_path.display()
-    );
-    fs::write(&asm_file, asm_content)?;
-
-    let lz4_file = temp_build.join("lz4_stub.c");
-    fs::write(&lz4_file, DECOMPRESSOR_C_SOURCE)?;
-
-    let c_file = temp_build.join("stub.c");
-    let c_content = format!(
-        r#"#include <windows.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#define SHIP_BUILD_HASH "{build_hash}"
-#define SHIP_CONSOLE {console}
-
-extern const unsigned char ship_payload_start[];
-extern const unsigned char ship_payload_end[];
-extern int ship_lz4_decompress(const unsigned char *src, size_t src_len, unsigned char *dest, size_t dest_len);
-
-/* Only with SHIP_DEBUG set: otherwise every launch would grow %TEMP%\ship_debug.log forever. */
-static void log_debug(const char* msg) {{
-    if (!getenv("SHIP_DEBUG")) return;
-    char temp[MAX_PATH];
-    GetTempPathA(MAX_PATH, temp);
-    char log_path[MAX_PATH];
-    snprintf(log_path, MAX_PATH, "%sship_debug.log", temp);
-    FILE* f = fopen(log_path, "a");
-    if (f) {{
-        fputs(msg, f);
-        fputc('\n', f);
-        fclose(f);
-    }}
-}}
-
-static unsigned int calc_crc32(const unsigned char *data, size_t len) {{
-    unsigned int crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {{
-        crc ^= (unsigned int)data[i];
-        for (int j = 0; j < 8; j++) {{
-            unsigned int mask = -(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB88320U & mask);
-        }}
-    }}
-    return ~crc;
-}}
-
-static void create_parent_dirs(char* path) {{
-    for (char* p = path; *p; p++) {{
-        if (*p == '/' || *p == '\\') {{
-            char old = *p;
-            *p = '\0';
-            CreateDirectoryA(path, NULL);
-            *p = old;
-        }}
-    }}
-}}
-
-static void delete_tree(const char* dir) {{
-    char pattern[MAX_PATH];
-    snprintf(pattern, MAX_PATH, "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h != INVALID_HANDLE_VALUE) {{
-        do {{
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-            char child[MAX_PATH];
-            snprintf(child, MAX_PATH, "%s\\%s", dir, fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {{
-                RemoveDirectoryA(child); /* never follow junctions/symlinks */
-                DeleteFileA(child);
-            }} else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {{
-                delete_tree(child);
-            }} else {{
-                SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL);
-                DeleteFileA(child);
-            }}
-        }} while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }}
-    RemoveDirectoryA(dir);
-}}
-
-static int is_build_hash(const char* s) {{
-    if (strlen(s) != 16) return 0;
-    for (; *s; s++) {{
-        char c = *s;
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return 0;
-    }}
-    return 1;
-}}
-
-/* Deletes extractions left by older builds of this app (<prefix><other hash>). Files of a
-   still-running old instance are locked and simply stay until the next launch. */
-static void remove_stale_extractions(const char* temp, const char* prefix) {{
-    char pattern[MAX_PATH];
-    snprintf(pattern, MAX_PATH, "%s%s*", temp, prefix);
-    size_t plen = strlen(prefix);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {{
-        const char* hash = fd.cFileName + plen;
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            && is_build_hash(hash) && strcmp(hash, SHIP_BUILD_HASH) != 0) {{
-            char stale[MAX_PATH];
-            snprintf(stale, MAX_PATH, "%s%s", temp, fd.cFileName);
-            delete_tree(stale);
-        }}
-    }} while (FindNextFileA(h, &fd));
-    FindClose(h);
-}}
-
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {{
-    log_debug("=== Ship Stub Launch ===");
-
-    char temp[MAX_PATH];
-    GetTempPathA(MAX_PATH, temp);
-
-    char app_dir[MAX_PATH];
-    const char* dir_prefix = "ShipApp_{main_exe_name}_";
-    snprintf(app_dir, MAX_PATH, "%s%s%s", temp, dir_prefix, SHIP_BUILD_HASH);
-    CreateDirectoryA(app_dir, NULL);
-
-    char hash_path[MAX_PATH];
-    snprintf(hash_path, MAX_PATH, "%s/.ship_hash", app_dir);
-
-    char exe_path[MAX_PATH];
-    snprintf(exe_path, MAX_PATH, "%s/%s", app_dir, "{target_bin_name}");
-
-    int need_extract = 1;
-    FILE* hf = fopen(hash_path, "r");
-    if (hf) {{
-        char stored_hash[64] = {{0}};
-        if (fgets(stored_hash, sizeof(stored_hash), hf)) {{
-            char* nl = strchr(stored_hash, '\n');
-            if (nl) *nl = '\0';
-            char* cr = strchr(stored_hash, '\r');
-            if (cr) *cr = '\0';
-            if (strcmp(stored_hash, SHIP_BUILD_HASH) == 0) {{
-                DWORD attr = GetFileAttributesA(exe_path);
-                if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {{
-                    need_extract = 0;
-                    log_debug("Payload hash match: skipping extraction");
-                }}
-            }}
-        }}
-        fclose(hf);
-    }}
-
-    if (need_extract) {{
-        log_debug("Extracting payload...");
-        const unsigned char* p = ship_payload_start;
-        const unsigned char* end_ptr = ship_payload_end;
-
-        if ((size_t)(end_ptr - p) < 12 || memcmp(p, "SHIP", 4) != 0) {{
-            log_debug("ERROR: Corrupted header");
-            MessageBoxA(NULL, "Corrupted binary package header.", "Ship Launch Error", MB_OK | MB_ICONERROR);
-            return 1;
-        }}
-
-        p += 4;
-        p += 2;
-        p += 2;
-
-        unsigned int file_count = 0;
-        memcpy(&file_count, p, 4);
-        p += 4;
-
-        const unsigned char* cur = p;
-        for (unsigned int i = 0; i < file_count; i++) {{
-            unsigned short plen = 0;
-            memcpy(&plen, cur, 2);
-            cur += 2 + plen + 8 + 8 + 8 + 4;
-        }}
-        const unsigned char* data_start = cur;
-
-        cur = p;
-        for (unsigned int i = 0; i < file_count; i++) {{
-            unsigned short path_len = 0;
-            memcpy(&path_len, cur, 2);
-            cur += 2;
-
-            char rel_path[MAX_PATH] = {{0}};
-            if (path_len < MAX_PATH) {{
-                memcpy(rel_path, cur, path_len);
-                rel_path[path_len] = '\0';
-            }}
-            cur += path_len;
-
-            unsigned long long uncomp_sz = 0;
-            memcpy(&uncomp_sz, cur, 8);
-            cur += 8;
-
-            unsigned long long comp_sz = 0;
-            memcpy(&comp_sz, cur, 8);
-            cur += 8;
-
-            unsigned long long offset = 0;
-            memcpy(&offset, cur, 8);
-            cur += 8;
-
-            unsigned int expected_crc = 0;
-            memcpy(&expected_crc, cur, 4);
-            cur += 4;
-
-            const unsigned char* comp_bytes = data_start + offset;
-            unsigned char* uncomp_bytes = (unsigned char*)malloc((size_t)uncomp_sz);
-            if (!uncomp_bytes && uncomp_sz > 0) {{
-                log_debug("ERROR: Memory allocation failed");
-                MessageBoxA(NULL, "Memory allocation failed during decompression.", "Ship Error", MB_OK | MB_ICONERROR);
-                return 2;
-            }}
-
-            if (uncomp_sz > 0) {{
-                int err = ship_lz4_decompress(comp_bytes, (size_t)comp_sz, uncomp_bytes, (size_t)uncomp_sz);
-                if (err != 0) {{
-                    char msg[256];
-                    snprintf(msg, sizeof(msg), "Failed decompressing '%s' (Error %d)", rel_path, err);
-                    log_debug(msg);
-                    MessageBoxA(NULL, msg, "Ship Decompression Error", MB_OK | MB_ICONERROR);
-                    free(uncomp_bytes);
-                    return 3;
-                }}
-
-                if (calc_crc32(uncomp_bytes, (size_t)uncomp_sz) != expected_crc) {{
-                    char msg[256];
-                    snprintf(msg, sizeof(msg), "CRC32 mismatch for '%s'", rel_path);
-                    log_debug(msg);
-                    MessageBoxA(NULL, msg, "Ship Integrity Error", MB_OK | MB_ICONERROR);
-                    free(uncomp_bytes);
-                    return 4;
-                }}
-            }}
-
-            char out_path[MAX_PATH];
-            snprintf(out_path, MAX_PATH, "%s/%s", app_dir, rel_path);
-            create_parent_dirs(out_path);
-
-            HANDLE hFile = CreateFileA(out_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {{
-                DWORD written = 0;
-                if (uncomp_sz > 0) {{
-                    WriteFile(hFile, uncomp_bytes, (DWORD)uncomp_sz, &written, NULL);
-                }}
-                CloseHandle(hFile);
-            }}
-
-            if (uncomp_bytes) {{
-                free(uncomp_bytes);
-            }}
-        }}
-
-        FILE* out_hf = fopen(hash_path, "w");
-        if (out_hf) {{
-            fputs(SHIP_BUILD_HASH, out_hf);
-            fclose(out_hf);
-        }}
-        log_debug("Extraction complete.");
-        remove_stale_extractions(temp, dir_prefix);
-    }}
-
-    /* Forward the stub's own arguments; lpCmdLine excludes the program name. */
-    static char cmd_line[32768];
-    snprintf(cmd_line, sizeof(cmd_line), "\"%s\" %s", exe_path, lpCmdLine ? lpCmdLine : "");
-
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-
-    log_debug("Spawning child process...");
-    if (CreateProcessA(exe_path, cmd_line, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {{
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-
-        char exit_msg[128];
-        snprintf(exit_msg, sizeof(exit_msg), "Process finished with exit code: %lu", code);
-        log_debug(exit_msg);
-
-        if (SHIP_CONSOLE && code != 0) {{
-            if (code >= 0xC0000000UL) {{
-                fprintf(stderr, "ship: application crashed with 0x%lX%s\n", code,
-                        code == 0xC0000135UL ? " (a required DLL is missing)" : "");
-            }}
-        }} else if (code >= 0xC0000000UL) {{
-            /* Only NTSTATUS failures (crash, missing DLL); a plain `return 1` is the app's business. */
-            char msg[512];
-            snprintf(msg, sizeof(msg),
-                "Application exited with code: 0x%lX (%lu)\n\n"
-                "If this is 0xC0000135, a required DLL is missing.\n"
-                "Path: %s",
-                code, code, exe_path);
-            MessageBoxA(NULL, msg, "Ship Runtime Alert", MB_OK | MB_ICONERROR);
-        }}
-        return (int)code;
-    }} else {{
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Failed to launch process '%s' (Error %lu)", exe_path, GetLastError());
-        log_debug(msg);
-        MessageBoxA(NULL, msg, "Ship Execution Error", MB_OK | MB_ICONERROR);
-    }}
-
-    return 1;
-}}
-"#
-    );
-    fs::write(&c_file, c_content)?;
+    let build_dir = StubBuildDir(staging_dir.parent().unwrap_or_else(|| Path::new(".")).join("ship_stub_build"));
+    let temp_build = &build_dir.0;
+    let sources = prepare_stub_sources(
+        staging_dir,
+        temp_build,
+        &target_bin_name,
+        opts.console,
+        STUB_WINDOWS_C,
+        ".section .rdata,\"dr\"",
+    )?;
 
     let icon_dest = temp_build.join("icon.ico");
     let icon = match &opts.project.icon {
@@ -986,45 +408,38 @@ END
     fs::write(&rc_file, rc_content)?;
 
     let res_file = temp_build.join("resource.o");
-    let windres_status = Command::new("x86_64-w64-mingw32-windres")
-        .current_dir(&temp_build)
-        .arg("resource.rc")
-        .arg("-O")
-        .arg("coff")
-        .arg("-o")
-        .arg("resource.o")
-        .status()
-        .context("Failed to invoke windres for icon and version resources")?;
-
-    if !windres_status.success() {
-        return Err(anyhow!("windres failed to compile resource file"));
-    }
+    let mut windres = Command::new("x86_64-w64-mingw32-windres");
+    windres.current_dir(temp_build).args(["resource.rc", "-O", "coff", "-o", "resource.o"]);
+    run_compiler(windres, "the icon and version resources")?;
 
     if let Some(parent) = output_exe.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let status = Command::new("x86_64-w64-mingw32-gcc")
-        .arg("-O2")
+    let mut cmd = Command::new("x86_64-w64-mingw32-gcc");
+    cmd.arg("-O2")
         .arg("-static")
         .arg("-static-libgcc")
         .arg(if opts.console { "-mconsole" } else { "-mwindows" })
-        .arg(&asm_file)
-        .arg(&c_file)
-        .arg(&lz4_file)
+        .arg("-I")
+        .arg(temp_build)
+        .args(&sources)
         .arg(&res_file)
         .arg("-luser32")
         .arg("-lkernel32")
         .arg("-o")
-        .arg(output_exe)
-        .status()
-        .context("Failed to invoke MinGW compiler for standalone stub")?;
+        .arg(output_exe);
+    run_compiler(cmd, "the Windows standalone launcher")
+}
 
-    let _ = fs::remove_dir_all(&temp_build);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if !status.success() {
-        return Err(anyhow!("Failed to build standalone executable"));
+    #[test]
+    fn c_string_escapes() {
+        assert_eq!(c_string("game.exe"), "\"game.exe\"");
+        assert_eq!(c_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(c_string("é"), "\"\\303\\251\"");
     }
-
-    Ok(())
 }
